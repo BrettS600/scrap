@@ -2,7 +2,8 @@
 4.py - the watcher. Opens one page in a stealth browser every ~90 seconds from your
 own internet connection (your home IP) and tells you when something new shows up.
 
-Fill in URL below (and ITEM_SELECTOR if you want new-listing detection), then press Run.
+Set URL below - or LINKS_FILE, to take a link from your spreadsheet without it ever being
+shown - (and ITEM_SELECTOR if you want new-listing detection), then press Run.
 Stop it with the stop button / Ctrl+C - it saves the browser's cookies on the way out,
 so the next run reuses the Cloudflare pass instead of solving a fresh challenge.
 
@@ -22,7 +23,12 @@ Everything it writes goes in the data/ folder next to this file:
 """
 
 # ---------------- settings ----------------
-URL = ""  # the page to watch, e.g. a search-results page sorted by newest
+# The page to watch. Either paste it into URL, or leave URL "" and set LINKS_FILE:
+# it then takes the black-highlighted link in row LINK_ROW of your spreadsheet.
+URL = ""
+LINKS_FILE = ""  # full path to your .xlsx - in Finder: right-click the file, hold Option, "Copy ... as Pathname"
+LINK_ROW = 2
+HIDE_ADDRESS = True  # never show the page's address or the site's name in the output or the logs
 
 # Optional. CSS selector matching ONE result/listing on the page (e.g. "li.result").
 # Set it and the watcher reports each new listing; leave it "" and it just
@@ -37,7 +43,7 @@ EVERY_SECONDS = 90  # starting gap between checks (it adjusts this itself over t
 JITTER_SECONDS = 20  # random +/- so checks don't land on a perfect beat
 MAX_CHECKS = 0  # 0 = keep going until you stop it
 
-HEADLESS = True  # False shows the Chrome window (it switches this itself if it helps)
+HEADLESS = False  # False = a Chrome window you can watch; True = hidden (it switches this itself if it helps)
 REAL_CHROME = True  # use your installed Google Chrome (looks most like a real person)
 
 # Auto-fix and learning
@@ -58,11 +64,13 @@ import csv
 import email.utils
 import hashlib
 import json
+import logging
 import os
 import random
 import re
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
@@ -109,13 +117,113 @@ OFFLINE_ERRORS = ("ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED", "ERR_NET
 CHALLENGE_TITLES = ("just a moment", "verify you are human", "attention required", "checking your browser")
 
 
+# ---------- keeping the address private ----------
+MASKS = []  # (pattern, replacement) pairs, filled in once the address is known
+
+
+def hide(url):
+    """Make every message and log line replace this page's address and its site's name."""
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    bare = host[4:] if host.startswith("www.") else host
+    MASKS.append((re.compile(re.escape(url), re.I), "[your page]"))
+    if not bare:
+        return
+    MASKS.append((re.compile(r"(?:[a-z][a-z0-9+.-]*:)?//[\w.-]*" + re.escape(bare) + r"""[^\s"'<>)]*""", re.I),
+                  "[a link on the site]"))
+    MASKS.append((re.compile(r"[\w.-]*" + re.escape(bare) + r"(?::\d+)?", re.I), "[the site]"))
+    label = bare.split(".")[0]
+    if len(label) >= 3 and not label.isdigit():  # e.g. the "example" in "Results | Example"
+        MASKS.append((re.compile(r"\b" + re.escape(label) + r"\b", re.I), "[the site]"))
+
+
+def mask(text):
+    text = str(text)
+    for pattern, replacement in MASKS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class MaskLogs(logging.Filter):
+    """Scrapling's own log lines include the address - hide it there too."""
+
+    def filter(self, record):
+        record.msg, record.args = mask(record.getMessage()), None
+        return True
+
+
+URL_IN_CELL = re.compile(r"""(?:https?://|www\.)[^\s"'<>)]+""", re.I)
+
+
+def cell_link(cell):
+    target = cell.hyperlink.target if cell.hyperlink is not None and cell.hyperlink.target else ""
+    for text in (target, cell.value if isinstance(cell.value, str) else ""):
+        m = URL_IN_CELL.search(text or "")
+        if m:
+            link = m.group(0).rstrip(".,;")
+            return link if link.lower().startswith("http") else "https://" + link
+    return ""
+
+
+def is_black(cell):
+    fill = cell.fill
+    if fill is None or fill.fill_type in (None, "none"):
+        return False
+    c = fill.fgColor
+    kind = getattr(c, "type", None)
+    if kind == "rgb" and isinstance(c.rgb, str) and len(c.rgb) >= 6:
+        r, g, b = (int(c.rgb[-6:][i:i + 2], 16) for i in (0, 2, 4))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b < 40
+    if kind == "theme":
+        return c.theme == 1 and (c.tint or 0) <= 0.25  # theme colour "Text 1" = black
+    if kind == "indexed":
+        return c.indexed in (8, 64)
+    return False
+
+
+def link_from_spreadsheet(path, row):
+    """The black-highlighted link in that row (or the row's only link). Never printed."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        sys.exit("Reading the spreadsheet needs openpyxl - run 3.py again, then Run 4.py.")
+    path = os.path.expanduser(path.strip().strip("'\""))
+    if not os.path.isabs(path):
+        path = os.path.join(HERE, path)
+    if not os.path.exists(path):
+        sys.exit(f"Can't find the spreadsheet at {path}\nCheck LINKS_FILE at the top of 4.py.")
+    try:
+        wb = load_workbook(path)
+    except Exception as e:
+        sys.exit(f"Couldn't open the spreadsheet ({type(e).__name__}). It needs to be an .xlsx file.")
+    sheets = [wb.active] + [s for s in wb.worksheets if s is not wb.active]
+    for ws in sheets:
+        if row > ws.max_row:
+            continue
+        links = [(cell, cell_link(cell)) for cell in ws[row]]
+        links = [(cell, link) for cell, link in links if link]
+        if not links:
+            continue
+        black = [(cell, link) for cell, link in links if is_black(cell)]
+        cell, link = (black or links)[0]
+        where = f"row {row}, column {cell.column_letter}" + ("" if ws is wb.active else f", sheet {sheets.index(ws) + 1}")
+        if black:
+            say(f"Using the black-highlighted link in {where}. Its address won't be shown.")
+        elif len(links) == 1:
+            say(f"Using the link in {where} (it isn't highlighted black, but it's the only link in that row).")
+        else:
+            say(f"No black-highlighted link in row {row} - using the first of its {len(links)} links ({where}).")
+        return link
+    sys.exit(f"No link found in row {row} of the spreadsheet. Check LINK_ROW at the top of 4.py.")
+
+
 # ---------- small helpers ----------
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def say(msg):
-    print(f"[{now()}] {msg}", flush=True)
+    print(f"[{now()}] {mask(msg)}", flush=True)
 
 
 def append_csv(path, header, row):
@@ -443,13 +551,13 @@ class Watcher:
         L = self.learned
         append_csv(CHECKS_CSV, ["time", "result", "detail", "status", "items_found", "new", "seconds",
                                 "every_s", "headless", "real_chrome"],
-                   [now(), kind or "ok", detail, status, found, new, round(seconds, 1),
+                   [now(), kind or "ok", mask(detail), status, found, new, round(seconds, 1),
                     round(L["every"]), L["headless"], L["real_chrome"]])
 
     def log_block(self, kind, detail, status, action):
         L = self.learned
         append_csv(BLOCKS_CSV, ["time", "kind", "detail", "status", "every_s", "headless", "real_chrome", "action"],
-                   [now(), kind, detail, status, round(L["every"]), L["headless"], L["real_chrome"], action])
+                   [now(), kind, mask(detail), status, round(L["every"]), L["headless"], L["real_chrome"], action])
 
     # ----- learning -----
     def after_clean_check(self):
@@ -534,7 +642,7 @@ class Watcher:
             try:
                 self.open_session(fresh=True)
             except Exception as e:
-                say(f"Couldn't start the browser ({e}); trying again after the next sleep.")
+                say(f"Couldn't start the browser ({str(e).splitlines()[0][:150]}); trying again after the next sleep.")
                 level += 1
                 continue
             started = time.time()
@@ -566,7 +674,8 @@ class Watcher:
             self.open_session()
         except Exception as e:
             if L["real_chrome"]:
-                sys.exit(f"Couldn't start Google Chrome ({e}).\nInstall Chrome, or set REAL_CHROME = False and Run again.")
+                sys.exit(mask(f"Couldn't start Google Chrome ({str(e).splitlines()[0][:150]}).\n"
+                              "Install Chrome, or set REAL_CHROME = False and Run again."))
             raise
         if os.path.exists(STATE_FILE):
             say("Reusing saved browser cookies.")
@@ -628,17 +737,28 @@ class Watcher:
 
 
 def main():
+    global URL
+    if not URL and LINKS_FILE:
+        URL = link_from_spreadsheet(LINKS_FILE, LINK_ROW)
     if not URL:
-        sys.exit("Set URL at the top of 4.py first (the page you want to watch), then Run again.")
+        sys.exit("Set URL or LINKS_FILE at the top of 4.py first (the page you want to watch), then Run again.")
+    if HIDE_ADDRESS:
+        hide(URL)
+        logging.getLogger("scrapling").addFilter(MaskLogs())
     os.makedirs(DATA, exist_ok=True)
-    w = Watcher()
+    w = None
     try:
+        w = Watcher()
         w.run()
     except KeyboardInterrupt:
         say("Stopped.")
+    except Exception:
+        print(mask(traceback.format_exc()), file=sys.stderr, flush=True)
+        sys.exit(1)
     finally:
-        w.learned.save()
-        w.close_session()
+        if w is not None:
+            w.learned.save()
+            w.close_session()
 
 
 if __name__ == "__main__":
