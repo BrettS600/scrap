@@ -27,7 +27,7 @@ Everything it writes goes in the data/ folder next to this file:
 # it then takes the black-highlighted link in row LINK_ROW of your spreadsheet.
 URL = ""
 LINKS_FILE = ""  # full path to your .xlsx - in Finder: right-click the file, hold Option, "Copy ... as Pathname"
-LINK_ROW = 2
+LINK_ROW = 3
 HIDE_ADDRESS = True  # never show the page's address or the site's name in the output or the logs
 
 # Optional. CSS selector matching ONE result/listing on the page (e.g. "li.result").
