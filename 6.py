@@ -30,9 +30,9 @@ LAST_ROW = 0  # 0 = to the end of the sheet
 LIMIT = 50  # stop after this many lookups per run (0 = no limit). Keep small while on the 100 MB trial.
 
 USE_PROXY = True  # False = use your home internet instead
-PROXY_HOST = "gate.decodo.com"  # copy from Decodo > Residential > Proxy setup
+PROXY_HOST = "us.decodo.com"  # copy from Decodo > Residential > Proxy setup
 PROXY_PORTS = "10001-10010"  # the port range shown there; each port is its own sticky IP
-PROXY_USER = "sp2e2o4qkx"  # the username shown there
+PROXY_USER = "user-sp2e2o4qkx-sessionduration-30"  # the username shown there
 PROXY_PASSWORD_FILE = "~/decodo-password.txt"  # a text file on your Mac holding only the password
 
 BROWSERS = 2  # how many browsers work at once (each on its own IP). More = faster.
