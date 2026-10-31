@@ -283,7 +283,7 @@ def export_csv(db, fields):
                 "SELECT row, link, status, how, found, wanted, data, tries, at FROM results ORDER BY row"):
             values = json.loads(data or "{}")
             w.writerow([row, link, status] + [values.get(n, "") for n in names]
-                       + [f"{found}/{wanted}" if wanted else "", how, tries, at])
+                       + [f"{found} of {wanted}" if wanted else "", how, tries, at])
     os.replace(tmp, RESULTS_CSV)
 
 
