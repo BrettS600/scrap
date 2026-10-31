@@ -1,0 +1,171 @@
+# 10.yml - the automatic link queue, for your results repo (not this one).
+#
+# Copy this whole file into the results repo as   .github/workflows/10.yml
+# (on GitHub: Add file > Create new file, type that name, paste, Commit changes).
+#
+# It runs on GitHub's computers, so it works with your laptop off:
+#   Queue 1 opens each new link through your Decodo proxy and saves the page.
+#   Queue 2 reads the saved pages, pulls out the items in fields.json, and saves results.csv.
+# A run starts by itself when the links file, fields.json or this file changes, every 6 hours to pick
+# up anything left over, or when you press "Run workflow" on the Actions tab.
+#
+# The code is 9.py in BrettS600/scrap. The proxy password comes from the repo secret DECODO_PASSWORD.
+# Settings are in env: below.
+
+name: Link queue
+
+on:
+  push:
+    paths: ["*.csv", "fields.json", ".github/workflows/**"]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      reread:
+        description: "Read every saved page again (e.g. after changing fields.json)"
+        type: boolean
+        default: false
+      retry_failed:
+        description: "Try links that already failed 3 times again"
+        type: boolean
+        default: false
+      reopen_missing:
+        description: "Open pages again that came out with missing items"
+        type: boolean
+        default: false
+
+concurrency:
+  group: link-queue
+  cancel-in-progress: false
+
+permissions:
+  contents: write # save results.csv
+  actions: write # find pages saved by earlier runs; start the next run
+
+env:
+  LIMIT: "50" # most links one run opens (0 = no limit). Keep 50 while on Decodo's 100 MB trial.
+  KEEP_GOING: "false" # "true" = start the next run straight away while links are left
+  BROWSERS: "2" # browsers at once, each on its own proxy IP
+  SAMPLE_PAGES: "20" # pages saved for the other chat before fields.json exists
+  RUN_MINUTES: "300" # a run stops opening links after this long (GitHub's limit is 6 hours)
+  LINKS_FILE: "" # "" = the CSV in the top folder that isn't results.csv
+  LINK_COLUMN: "0" # 0 = the first web address in each row; or a column number or heading
+  MAX_FIELD_CHARS: "2000" # longest text kept per item
+  PROXY_HOST: "us.decodo.com"
+  PROXY_PORTS: "10001-10010"
+  PROXY_USER: "user-sp2e2o4qkx-sessionduration-30"
+  CODE_REPO: "BrettS600/scrap"
+  REPO_DIR: repo
+  PAGES_DIR: pages
+  INBOX_DIR: inbox
+
+jobs:
+  open:
+    name: "Queue 1: open pages"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      RETRY_FAILED: ${{ inputs.retry_failed && 'true' || 'false' }}
+      REOPEN_MISSING: ${{ inputs.reopen_missing && 'true' || 'false' }}
+    outputs:
+      work: ${{ steps.plan.outputs.work }}
+    steps:
+      - name: Get the links and results
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          path: repo
+          persist-credentials: false
+      - name: Get the code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Plan
+        id: plan
+        run: python code/9.py plan
+      - name: Install Scrapling and the browser
+        if: steps.plan.outputs.work == 'true'
+        run: |
+          python -m pip install -q "scrapling[fetchers]==0.5"
+          python -m patchright install --with-deps chromium > /dev/null
+          command -v xvfb-run > /dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+      - name: Open pages
+        if: steps.plan.outputs.work == 'true'
+        env:
+          DECODO_PASSWORD: ${{ secrets.DECODO_PASSWORD }}
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" python code/9.py open
+      - name: Hand the pages to queue 2
+        if: always() && steps.plan.outputs.work == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pages-${{ github.run_id }}
+          path: pages/
+          retention-days: 30
+          if-no-files-found: ignore
+          overwrite: true
+
+  read:
+    name: "Queue 2: read pages"
+    needs: open
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REOPEN_MISSING: ${{ inputs.reopen_missing && 'true' || 'false' }}
+      REREAD: ${{ (inputs.reread || (github.event_name == 'push' && contains(toJSON(github.event.commits), '"fields.json"'))) && 'true' || 'false' }}
+    steps:
+      - name: Get the links and results
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          path: repo
+      - name: Get the code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Scrapling
+        run: python -m pip install -q "scrapling==0.5"
+      - name: Get this run's pages
+        if: needs.open.outputs.work == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pages-${{ github.run_id }}
+          path: inbox/${{ github.run_id }}
+      - name: Read pages
+        id: read
+        run: python code/9.py read
+      - name: Save results
+        working-directory: repo
+        env:
+          MESSAGE: ${{ steps.read.outputs.message }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "Nothing new to save."; exit 0; fi
+          git commit -q -m "${MESSAGE:-Update results}"
+          for i in 1 2 3 4 5; do
+            if git pull -q --rebase && git push -q; then echo "Saved to the repo."; exit 0; fi
+            git rebase --abort 2> /dev/null || true
+            sleep $((i * 10))
+          done
+          echo "Couldn't save the results to the repo."
+          exit 1
+      - name: Start the next run
+        if: steps.read.outputs.more == 'true' && env.KEEP_GOING == 'true'
+        run: |
+          workflow="${GITHUB_WORKFLOW_REF%@*}"
+          gh workflow run "${workflow##*/}" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          echo "Links are left, so the next run is queued."
