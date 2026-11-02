@@ -1,0 +1,120 @@
+# 12.yml - the link opener for your extension, for your results repo (not this one).
+#
+# Copy this whole file into the results repo as   .github/workflows/12.yml
+# (on GitHub: Add file > Create new file, type that name, paste, Commit changes).
+#
+# It runs on GitHub's computers, so it works with your laptop off. For each new link in your links
+# file it opens the page through your Decodo proxy, in a browser with your extension loaded, waits
+# for the extension to read it, and saves the read to your inbox repo, 100 at a time.
+# A run starts by itself when the links file or this file changes, every 6 hours to pick up anything
+# left over, or when you press "Run workflow" on the Actions tab. Progress is kept in opened.csv.
+#
+# Needs two repo secrets: DECODO_PASSWORD (the proxy password) and CARD_INBOX_KEY (a GitHub key
+# that can write to the inbox repo). The code is 11.py in BrettS600/scrap.
+
+name: Link opener
+
+on:
+  push:
+    paths: ["*.csv", "!opened.csv", ".github/workflows/**"]
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      retry_failed:
+        description: "Try links that already failed 3 times again"
+        type: boolean
+        default: false
+
+concurrency:
+  group: link-opener
+  cancel-in-progress: false
+
+permissions:
+  contents: write # save opened.csv
+  actions: write # start the next run
+
+env:
+  LIMIT: "50" # most links one run opens (0 = no limit). Keep it small until you've seen the data use.
+  KEEP_GOING: "false" # "true" = start the next run straight away while links are left
+  BROWSERS: "2" # browsers at once, each on its own proxy IP
+  RUN_MINUTES: "300" # a run stops opening links after this long (GitHub's limit is 6 hours)
+  LINKS_FILE: "" # "" = the CSV in the top folder (links.csv if there are several)
+  LINK_COLUMN: "0" # 0 = the first web address in each row; or a column number or heading
+  EXTENSION_FOLDER: "cert-reader" # the extension's folder in this repo
+  INBOX_REPO: "BrettS600/card-inbox" # where the reads are saved
+  INBOX_FOLDER: "certs"
+  BATCH: "100" # reads per save
+  READ_WAIT_SECONDS: "25" # longest wait for the extension's first read of a page
+  SETTLE_SECONDS: "5" # a read counts as finished after this long without changing
+  LIGHT: "true" # skip pictures, fonts, styles, video and trackers to save proxy data
+  PROXY_HOST: "us.decodo.com"
+  PROXY_PORTS: "10001-10010"
+  PROXY_USER: "user-sp2e2o4qkx-sessionduration-30"
+  CODE_REPO: "BrettS600/scrap"
+  REPO_DIR: repo
+
+jobs:
+  open:
+    name: "Open links"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      RETRY_FAILED: ${{ inputs.retry_failed && 'true' || 'false' }}
+    steps:
+      - name: Get the links and the extension
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          path: repo
+      - name: Get the code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Plan
+        id: plan
+        run: python code/11.py plan
+      - name: Install Scrapling and the browser
+        if: steps.plan.outputs.work == 'true'
+        run: |
+          python -m pip install -q "scrapling[fetchers]==0.5"
+          python -m patchright install --with-deps chromium > /dev/null
+          command -v xvfb-run > /dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+      - name: Open links
+        id: open
+        if: steps.plan.outputs.work == 'true'
+        env:
+          DECODO_PASSWORD: ${{ secrets.DECODO_PASSWORD }}
+          CARD_INBOX_KEY: ${{ secrets.CARD_INBOX_KEY }}
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" python code/11.py open
+      - name: Save progress
+        if: always() && steps.plan.outputs.work == 'true'
+        working-directory: repo
+        env:
+          MESSAGE: ${{ steps.open.outputs.message }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add opened.csv 2> /dev/null || true
+          if git diff --cached --quiet; then echo "Nothing new to save."; exit 0; fi
+          git commit -q -m "${MESSAGE:-Opened links}"
+          for i in 1 2 3 4 5; do
+            if git pull -q --rebase && git push -q; then echo "Progress saved."; exit 0; fi
+            git rebase --abort 2> /dev/null || true
+            sleep $((i * 10))
+          done
+          echo "Couldn't save opened.csv to the repo."
+          exit 1
+      - name: Start the next run
+        if: steps.open.outputs.more == 'true' && env.KEEP_GOING == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          workflow="${GITHUB_WORKFLOW_REF%@*}"
+          gh workflow run "${workflow##*/}" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          echo "Links are left, so the next run is queued."
