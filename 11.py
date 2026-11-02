@@ -13,9 +13,10 @@ The extension gets no key here, so it never sends anything itself (no double sav
 A link only counts as done once its read is safely saved. Progress is kept in opened.csv in the
 results repo: one row per link, with its status.
 
-To save proxy data, pages after the first on each proxy address skip pictures, fonts, styles,
-video and ad/tracking scripts. If a page then gives no read, it's opened again in full, and after
-3 of those the whole run loads pages in full.
+To save proxy data, pages after the first on each proxy address skip pictures, fonts, video and
+ad/tracking scripts, while the browser's cache keeps the site's own code from being downloaded
+again for every page. If a page then gives no read, it's opened again in full, and after 3 of
+those the whole run loads pages in full. Each run's summary shows what the proxy data went on.
 
 The log only ever shows row numbers and counts - never links, page text or what was read.
 Settings come from the env: section of 12.yml; the defaults are below.
@@ -78,7 +79,7 @@ BATCH = env_num("BATCH", 100)  # reads per save (the first save of a run is afte
 
 READ_WAIT_SECONDS = env_num("READ_WAIT_SECONDS", 25)  # longest wait for the extension's first read
 SETTLE_SECONDS = env_num("SETTLE_SECONDS", 5)  # a read counts as finished after this long without changing
-LIGHT = env_bool("LIGHT", True)  # skip pictures, fonts, styles, video and trackers (after each IP's first page)
+LIGHT = env_bool("LIGHT", True)  # skip pictures, fonts, video and trackers (after each IP's first page)
 HEADLESS = env_bool("HEADLESS", False)  # 12.yml runs a hidden screen, so a "visible" browser works there
 MATCH_TIMEZONE = env_bool("MATCH_TIMEZONE", True)  # browser clock = the proxy IP's time zone
 PAUSE_SECONDS = tuple(float(x) for x in (env("PAUSE_SECONDS", "1-3").split("-") + ["3"])[:2])
@@ -113,6 +114,10 @@ TRACKERS = {
     "optimizely.com", "branch.io", "adnxs.com", "rubiconproject.com", "pubmatic.com", "casalemedia.com",
     "moatads.com", "chartbeat.com", "mixpanel.com", "amplitude.com", "heap.io", "intercomcdn.com",
 }
+# Blocked through the browser's debugging channel, not Playwright routing: routing turns the cache off,
+# which made every page download the site's code again (2.4 MB a page in the first real run).
+BLOCK_PATTERNS = ([{"resourceType": t, "requestStage": "Request"} for t in ("Image", "Media", "Font")]
+                  + [{"urlPattern": p, "requestStage": "Request"} for d in sorted(TRACKERS) for p in (f"*://{d}/*", f"*://*.{d}/*")])
 SECRETS = [s for s in (PASSWORD, KEY) if len(s) >= 6]  # (links with a password in them are hidden whole anyway)
 URL_RE = re.compile(r"""\b(?:https?|wss?|file)://[^\s"'<>)]+""", re.I)
 HOSTS_RE = None  # the hostnames in the links file, hidden from all output
@@ -533,6 +538,8 @@ class Worker:
         self.ext = None
         self.passed = set()
         self.profile = os.path.join(WORK, f"browser-{n}")  # kept between restarts: the cache saves proxy data
+        self.cdp = []  # one debugging session per tab, used to skip pictures, fonts, video and trackers
+        self.blocking = False
 
     async def ip_timezone(self):
         from scrapling.fetchers import FetcherSession
@@ -569,6 +576,10 @@ class Worker:
         await self.browser.start()
         ctx = self.browser.context
         ctx.on("requestfinished", self.job.count_bytes)
+        self.cdp, self.blocking = [], False
+        for p in ctx.pages:
+            await self.attach(p)
+        ctx.on("page", lambda p: asyncio.ensure_future(self.attach(p)))
         self.ext = await ctx.new_page()
         url = f"chrome-extension://{self.job.ext_id}/{self.job.ext_popup}"
         try:
@@ -583,6 +594,39 @@ class Worker:
             else:
                 raise Stop(f"The extension didn't load in the browser ({short(e)}). Check that its folder in this repo "
                            "is the whole extension, with manifest.json at its top.")
+
+    async def attach(self, page):
+        try:
+            cdp = await self.browser.context.new_cdp_session(page)
+        except Exception:
+            return
+
+        async def skip(ev):
+            try:
+                await cdp.send("Fetch.failRequest", {"requestId": ev["requestId"], "errorReason": "BlockedByClient"})
+            except Exception:
+                pass
+
+        cdp.on("Fetch.requestPaused", lambda ev: asyncio.ensure_future(skip(ev)))
+        self.cdp.append(cdp)
+        if self.blocking:
+            await self.block(cdp, True)
+
+    @staticmethod
+    async def block(cdp, on):
+        try:
+            if on:
+                await cdp.send("Fetch.enable", {"patterns": BLOCK_PATTERNS})
+            else:
+                await cdp.send("Fetch.disable")
+        except Exception:
+            pass
+
+    async def set_blocking(self, on):
+        if on != self.blocking:
+            self.blocking = on
+            for cdp in list(self.cdp):
+                await self.block(cdp, on)
 
     async def close(self):
         if self.browser is not None:
@@ -629,10 +673,8 @@ class Worker:
         async def action(page):
             await self.wait_for_read(page, box)
 
-        options = dict(page_action=action, google_search=False, disable_resources=light)
-        if light:
-            options["blocked_domains"] = TRACKERS
-        page = await self.browser.fetch(url, **options)
+        await self.set_blocking(light)
+        page = await self.browser.fetch(url, page_action=action, google_search=False)
         return classify(page), box.get("reads") or {}
 
     async def lookup(self, row, url):
@@ -701,6 +743,7 @@ class Job:
         self.deadline = self.started + RUN_MINUTES * 60
         self.taken, self.stop, self.out_of_time, self.problem = 0, False, False, None
         self.bytes = 0
+        self.by_type = {}
         self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0}
 
     def proxy_url(self, port):
@@ -712,8 +755,11 @@ class Job:
         try:
             if request.url.startswith(("http://", "https://")):
                 sizes = await request.sizes()
-                self.bytes += (sizes.get("responseBodySize") or 0) + (sizes.get("responseHeadersSize") or 0) \
+                n = (sizes.get("responseBodySize") or 0) + (sizes.get("responseHeadersSize") or 0) \
                     + (sizes.get("requestHeadersSize") or 0) + (sizes.get("requestBodySize") or 0)
+                self.bytes += n
+                kind = request.resource_type or "other"
+                self.by_type[kind] = self.by_type.get(kind, 0) + n
         except Exception:
             pass
 
@@ -792,6 +838,10 @@ def report(job, final=False):
             f"{s['no read']} no read, {s['blocked']} blocked, {s['error']} errors, {s['not found']} not found - "
             f"{mins:.0f} min.{data}")
     say(line)
+    if final and USE_PROXY and pages and job.by_type:
+        top = sorted(job.by_type.items(), key=lambda kv: -kv[1])[:6]
+        say("Data per page by type: " + ", ".join(f"{k} {v / 1e3 / pages:.0f} KB" for k, v in top)
+            + f". Skipping pictures/fonts/video/trackers: {'off' if job.light_off else 'on'}.")
     return line
 
 
