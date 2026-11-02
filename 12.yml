@@ -11,6 +11,9 @@
 #
 # Needs two repo secrets: DECODO_PASSWORD (the proxy password) and CARD_INBOX_KEY (a GitHub key
 # that can write to the inbox repo). The code is 11.py in BrettS600/scrap.
+# Optional third secret, SCRAP_REPORT_KEY (a GitHub key for BrettS600/scrap only, Issues: Read and
+# write): with it, every run posts a short report (counts, step results, stop reasons - no links)
+# as a comment on the "Link opener reports" issue in scrap, so the chat that built this can read it.
 
 name: Link opener
 
@@ -80,19 +83,26 @@ jobs:
         id: plan
         run: python code/11.py plan
       - name: Install Scrapling and the browser
+        id: install
         if: steps.plan.outputs.work == 'true'
         run: |
-          python -m pip install -q "scrapling[fetchers]==0.5"
-          python -m patchright install --with-deps chromium > /dev/null
-          command -v xvfb-run > /dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+          set -o pipefail
+          {
+            python -m pip install -q "scrapling[fetchers]==0.5"
+            python -m patchright install --with-deps chromium > /dev/null
+            command -v xvfb-run > /dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+          } 2>&1 | tee "$RUNNER_TEMP/install.log"
       - name: Open links
         id: open
         if: steps.plan.outputs.work == 'true'
         env:
           DECODO_PASSWORD: ${{ secrets.DECODO_PASSWORD }}
           CARD_INBOX_KEY: ${{ secrets.CARD_INBOX_KEY }}
-        run: xvfb-run -a -s "-screen 0 1920x1080x24" python code/11.py open
+        run: |
+          set -o pipefail
+          xvfb-run -a -s "-screen 0 1920x1080x24" python code/11.py open 2>&1 | tee "$RUNNER_TEMP/opener.log"
       - name: Save progress
+        id: save
         if: always() && steps.plan.outputs.work == 'true'
         working-directory: repo
         env:
@@ -118,3 +128,32 @@ jobs:
           workflow="${GITHUB_WORKFLOW_REF%@*}"
           gh workflow run "${workflow##*/}" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
           echo "Links are left, so the next run is queued."
+      - name: Report to scrap
+        if: always() && (steps.plan.outputs.work == 'true' || failure())
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SCRAP_REPORT_KEY }}
+          RESULT: ${{ job.status }}
+          STEPS: "plan: ${{ steps.plan.outcome }}, install: ${{ steps.install.outcome }}, open links: ${{ steps.open.outcome }}, save progress: ${{ steps.save.outcome }}"
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "No SCRAP_REPORT_KEY secret, so no report was sent."; exit 0; fi
+          report="$RUNNER_TEMP/report.md"
+          {
+            echo "### Run $GITHUB_RUN_NUMBER: $RESULT ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            echo "Steps - $STEPS"
+            if [ -s "$RUNNER_TEMP/opener.log" ]; then
+              echo; echo "Opener log (last 40 lines; row numbers and counts only):"; echo '```'
+              tail -n 40 "$RUNNER_TEMP/opener.log"; echo '```'
+            fi
+            if [ "${{ steps.install.outcome }}" = "failure" ] && [ -s "$RUNNER_TEMP/install.log" ]; then
+              echo; echo "Install log (last 20 lines):"; echo '```'; tail -n 20 "$RUNNER_TEMP/install.log"; echo '```'
+            fi
+          } > "$report"
+          title="Link opener reports"
+          issue=$(gh issue list -R "$CODE_REPO" --state open --search "$title in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+          if [ -z "$issue" ]; then
+            issue=$(gh issue create -R "$CODE_REPO" --title "$title" \
+              --body "Each run of the link opener adds a comment here: counts, step results and stop reasons only." | grep -o '[0-9]*$')
+          fi
+          gh issue comment "$issue" -R "$CODE_REPO" --body-file "$report" > /dev/null && echo "Report sent to scrap."
