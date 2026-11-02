@@ -19,7 +19,10 @@ again for every page. If a page then gives no read, it's opened again in full, a
 those the whole run loads pages in full. Each run's summary shows what the proxy data went on.
 
 The log only ever shows row numbers and counts - never links, page text or what was read.
-Settings come from the env: section of 12.yml; the defaults are below.
+Settings come from the env: section of 12.yml; the defaults are below. 13.py runs this same code on
+your Mac instead (home internet, no proxy) for the big list.
+
+Ctrl+C (or cancelling the run) finishes the page in progress and saves before stopping.
 
 By hand:  python 11.py plan | open
 """
@@ -33,6 +36,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -62,7 +66,7 @@ def env_num(name, default):
 LINKS_FILE = env("LINKS_FILE", "")  # "" = the CSV in the repo's top folder (links.csv if there are several)
 LINK_COLUMN = env("LINK_COLUMN", "0")  # 0 = the first web address in each row; or a column number or heading
 LIMIT = env_num("LIMIT", 50)  # most links one run opens (0 = no limit)
-RUN_MINUTES = env_num("RUN_MINUTES", 300)  # stop opening links after this long (GitHub stops a job at 6 hours)
+RUN_MINUTES = env_num("RUN_MINUTES", 300)  # stop opening links after this long (GitHub stops a job at 6 hours; 0 = no limit)
 BROWSERS = env_num("BROWSERS", 2)  # browsers at once, each on its own proxy IP
 
 USE_PROXY = env_bool("USE_PROXY", True)
@@ -75,6 +79,7 @@ EXTENSION_FOLDER = env("EXTENSION_FOLDER", "cert-reader")  # the extension's fol
 INBOX_REPO = env("INBOX_REPO", "BrettS600/card-inbox")  # where reads are saved
 INBOX_FOLDER = env("INBOX_FOLDER", "certs")  # folder in that repo
 KEY = os.environ.get("CARD_INBOX_KEY", "").strip()  # GitHub key that can write to INBOX_REPO; never printed
+KEY_WHERE = env("KEY_WHERE", "the CARD_INBOX_KEY secret")  # where that key is kept, for messages
 BATCH = env_num("BATCH", 100)  # reads per save (the first save of a run is after 5, to check the key early)
 
 READ_WAIT_SECONDS = env_num("READ_WAIT_SECONDS", 25)  # longest wait for the extension's first read
@@ -90,9 +95,9 @@ IP_CHECK_URL = env("IP_CHECK_URL", "https://ip.decodo.com/json")
 
 FIRST_BATCH = 5
 PORT_COOLDOWN_SECONDS = 600
-BLOCKS_BEFORE_PAUSE = 10
-PAUSE_ALL_MINUTES = 15
-PAUSES_BEFORE_STOP = 3
+BLOCKS_BEFORE_PAUSE = env_num("BLOCKS_BEFORE_PAUSE", 10)
+PAUSE_ALL_MINUTES = env_num("PAUSE_ALL_MINUTES", 15.0)
+PAUSES_BEFORE_STOP = env_num("PAUSES_BEFORE_STOP", 3)
 ERRORS_BEFORE_STOP = 6
 FULL_LOADS_BEFORE_LIGHT_OFF = 3
 
@@ -100,7 +105,7 @@ REPO = os.path.abspath(env("REPO_DIR", "repo"))  # the results repo, checked out
 WORK = os.path.abspath(env("WORK_DIR", os.path.join(tempfile.gettempdir(), "link-opener")))
 INBOX_URL = env("INBOX_URL", "")  # for testing; normally built from INBOX_REPO and KEY
 RUN_ID = env_num("GITHUB_RUN_ID", int(time.time()))
-STATUS_FILE = os.path.join(REPO, "opened.csv")
+STATUS_FILE = os.path.join(REPO, env("STATUS_FILE", "opened.csv"))  # progress; a full path is used as it is
 
 CHALLENGE_TITLES = ("just a moment", "verify you are human", "attention required", "checking your browser")
 BLOCK_KINDS = {"challenge", "firewall", "fingerprint", "ip_ban", "rate_limit"}
@@ -140,7 +145,8 @@ def say(msg):
 
 class MaskLogs(logging.Filter):
     def filter(self, record):
-        record.msg, record.args = mask(record.getMessage()), None
+        msg = re.sub(r"\s*Call log:(?:\n\s+-[^\n]*)*\s*", " ", record.getMessage())  # Playwright's step list
+        record.msg, record.args = mask(msg), None
         return True
 
 
@@ -198,9 +204,7 @@ def cell_link(text):
 def links_path():
     if LINKS_FILE:
         path = os.path.join(REPO, LINKS_FILE)
-        if not os.path.isfile(path):
-            raise Stop("LINKS_FILE in 12.yml names a file that isn't in the repo's top folder.")
-        return path
+        return path if os.path.isfile(path) else None
     names = sorted(n for n in os.listdir(REPO) if n.lower().endswith(".csv") and not NOT_LINKS.fullmatch(n))
     if not names:
         return None
@@ -296,7 +300,8 @@ def plan(quiet=False):
     links = read_links()
     if links is None:
         if not quiet:
-            say("There's no links CSV in the repo's top folder yet. Upload it there and a run starts by itself.")
+            say(f"There's no {LINKS_FILE} in the top folder yet, so there's nothing to open." if LINKS_FILE else
+                "There's no links CSV in the repo's top folder yet. Upload it there and a run starts by itself.")
         return [], [], {}
     status = load_status()
     for row, link in links:  # keep row numbers current if rows moved
@@ -347,7 +352,10 @@ AUTH_WORDS = ("403", "401", "authentication failed", "could not read username", 
 
 def git(args, cwd=None, timeout=600):
     env_ = dict(os.environ, GIT_TERMINAL_PROMPT="0")
-    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env_)
+    # With a key in the address, keep git's saved-login helper out of it, so the key is never stored
+    # (on a Mac it would otherwise go into the Keychain in place of your own GitHub login).
+    pre = ["-c", "credential.helper="] if KEY and not INBOX_URL else []
+    r = subprocess.run(["git"] + pre + args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env_)
     return r.returncode, mask((r.stdout or "") + (r.stderr or ""))
 
 
@@ -394,9 +402,9 @@ def push_reads(records):
             if rc == 0:
                 return len(files)
             if any(w in out.lower() for w in AUTH_WORDS):
-                raise Stop("GitHub turned down the CARD_INBOX_KEY secret: it's wrong, expired, or can't write to "
-                           f"{INBOX_REPO}. Make a new key with Contents: Read and write on that repo and save it as the "
-                           "secret again. Reads from this run weren't saved; those links get opened again next run.")
+                raise Stop(f"GitHub turned down {KEY_WHERE}: it's wrong, expired, or can't write to "
+                           f"{INBOX_REPO}. Make a new key with Contents: Read and write on that repo and save it "
+                           "again. Reads from this run weren't saved; those links get opened again next run.")
             say(f"Saving to the inbox repo didn't go through (try {attempt + 1}): {out.strip()[:150]}")
         finally:
             shutil.rmtree(folder, ignore_errors=True)
@@ -740,8 +748,9 @@ class Job:
         self.light_off, self.full_needed = not LIGHT, 0
         self.blocks_in_a_row, self.errors_in_a_row, self.pauses, self.pause_until = 0, 0, 0, 0
         self.started = time.time()
-        self.deadline = self.started + RUN_MINUTES * 60
+        self.deadline = self.started + RUN_MINUTES * 60 if RUN_MINUTES > 0 else float("inf")
         self.taken, self.stop, self.out_of_time, self.problem = 0, False, False, None
+        self.why = None  # why it stopped early: "errors", "blocked", "user" or "problem"
         self.bytes = 0
         self.by_type = {}
         self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0}
@@ -778,12 +787,14 @@ async def worker_loop(worker, queue, job):
         if time.time() > job.deadline:
             job.out_of_time = True
             return
+        while time.time() < job.pause_until and not job.stop:
+            await asyncio.sleep(min(5, max(0.1, job.pause_until - time.time())))
+        if job.stop:
+            return
         try:
             row, url = queue.get_nowait()
         except asyncio.QueueEmpty:
             return
-        if time.time() < job.pause_until:
-            await asyncio.sleep(job.pause_until - time.time())
         job.taken += 1
         try:
             kind, reads = await worker.lookup(row, url)
@@ -808,7 +819,7 @@ async def worker_loop(worker, queue, job):
             say(f"Row {row}: {status_name(kind)}.")
             job.errors_in_a_row = job.errors_in_a_row + 1 if bucket == "error" else 0
             if job.errors_in_a_row >= ERRORS_BEFORE_STOP:
-                job.stop = True
+                job.stop, job.why = True, job.why or "errors"
                 say(f"{ERRORS_BEFORE_STOP} errors in a row - something's wrong with the connection, so this run stops. "
                     "The next run tries again.")
                 return
@@ -818,11 +829,11 @@ async def worker_loop(worker, queue, job):
                     job.pauses += 1
                     job.blocks_in_a_row = 0
                     if job.pauses >= PAUSES_BEFORE_STOP:
-                        job.stop = True
+                        job.stop, job.why = True, job.why or "blocked"
                         say("Still blocked after several pauses - stopping this run. The next run tries again later.")
                         return
                     job.pause_until = time.time() + PAUSE_ALL_MINUTES * 60
-                    say(f"{BLOCKS_BEFORE_PAUSE} blocked lookups in a row - pausing for {PAUSE_ALL_MINUTES} min.")
+                    say(f"{BLOCKS_BEFORE_PAUSE} blocked lookups in a row - pausing for {PAUSE_ALL_MINUTES:g} min.")
         if job.taken % 25 == 0:
             report(job)
         await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
@@ -866,7 +877,7 @@ def check_key():
     rc, out = git(["ls-remote", "-q", inbox_url(), "HEAD"], timeout=60)
     if rc != 0:
         if any(w in out.lower() for w in AUTH_WORDS):
-            raise Stop(f"GitHub turned down the CARD_INBOX_KEY secret: it's wrong, expired, or can't reach {INBOX_REPO}. "
+            raise Stop(f"GitHub turned down {KEY_WHERE}: it's wrong, expired, or can't reach {INBOX_REPO}. "
                        "No links were tried.")
         raise Stop(f"Couldn't reach the inbox repo ({out.strip()[:120]}). No links were tried; the next run tries again.")
     say("Inbox key accepted.")
@@ -876,7 +887,7 @@ async def open_links():
     todo, links, status = plan()
     if not todo:
         output(more="false")
-        return
+        return None
     if USE_PROXY and not PASSWORD:
         raise Stop("The DECODO_PASSWORD secret isn't set. In this repo: Settings > Secrets and variables > Actions > "
                    "New repository secret. No links were tried.")
@@ -885,6 +896,20 @@ async def open_links():
                    "Settings > Secrets and variables > Actions > New repository secret. No links were tried.")
     folder, popup = find_extension()
     job = Job(status, folder, popup)
+    loop = asyncio.get_running_loop()
+
+    def ask_stop():
+        job.stop, job.why = True, "user"
+        say("Stopping: finishing the page in progress and saving. Press Ctrl+C again to stop at once.")
+        try:
+            loop.remove_signal_handler(signal.SIGINT)
+        except Exception:
+            pass
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, ask_stop)
+    except (NotImplementedError, RuntimeError, ValueError):
+        pass
     check_key()
     if USE_PROXY:
         await check_proxy(job)
@@ -901,7 +926,7 @@ async def open_links():
         while waiting:  # if one browser hits a problem, the others finish their link and stop too
             done, waiting = await asyncio.wait(waiting, return_when=asyncio.FIRST_EXCEPTION)
             if any(t.exception() for t in done):
-                job.stop = True
+                job.stop, job.why = True, job.why or "problem"
         for t in tasks:
             e = t.exception()
             if isinstance(e, Stop):
@@ -933,13 +958,23 @@ async def open_links():
         if unsaved:
             say(f"{unsaved} read(s) couldn't be saved; those links get opened again next run.")
         if job.out_of_time:
-            say(f"Reached RUN_MINUTES ({RUN_MINUTES}); the rest wait for the next run.")
+            say(f"Reached RUN_MINUTES ({RUN_MINUTES:g}); the rest wait for the next run.")
         summary([f"**Link opener** - {line}"])  # a stop reason is added by main()
         left = sum(1 for _, u in links if not is_done(status.get(u)))
         output(more=str(bool(left) and job.saver.saved > 0 and not job.problem).lower(),
                message=f"Opened links: {job.saver.saved} saved, {left} to go")
     if job.problem:
         raise Stop(job.problem)
+    return job
+
+
+def setup_logging():
+    """Scrapling's own log messages: warnings only, with links and secrets hidden."""
+    from scrapling.fetchers import AsyncStealthySession, FetcherSession  # loading these sets up its logger
+
+    del AsyncStealthySession, FetcherSession
+    logging.getLogger("scrapling").addFilter(MaskLogs())
+    logging.getLogger("scrapling").setLevel(logging.WARNING)
 
 
 def main():
@@ -953,10 +988,7 @@ def main():
             todo, _, _ = plan()
             output(work=str(bool(todo)).lower())
         else:
-            from scrapling.fetchers import AsyncStealthySession, FetcherSession  # noqa: F401 - sets up its logger
-
-            logging.getLogger("scrapling").addFilter(MaskLogs())
-            logging.getLogger("scrapling").setLevel(logging.WARNING)
+            setup_logging()
             asyncio.run(open_links())
     except Stop as e:
         say(str(e))
