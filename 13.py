@@ -279,8 +279,9 @@ def work_through_the_list():
     while True:
         try:
             job = asyncio.run(opener.open_links())
-        except opener.Stop as e:
-            raise Problem(str(e))
+        except opener.Stop as e:  # (11.py's wording is for GitHub; on the Mac the password is in a file)
+            raise Problem(str(e).replace("the DECODO_PASSWORD secret and PROXY_USER in 12.yml",
+                                         f"{PASSWORD_FILE} and PROXY_USER at the top of 13.py"))
         if job is None:
             return
         if job.why == "user":
