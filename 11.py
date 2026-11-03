@@ -100,6 +100,14 @@ PAUSE_ALL_MINUTES = env_num("PAUSE_ALL_MINUTES", 15.0)
 PAUSES_BEFORE_STOP = env_num("PAUSES_BEFORE_STOP", 3)
 ERRORS_BEFORE_STOP = 6
 FULL_LOADS_BEFORE_LIGHT_OFF = 3
+# A site whose pages load but have nothing for the extension to read, while the data is there when you look
+# yourself, is usually holding its data back because its pages came too fast. So each site gets its own pace:
+# after a page with no read, that site's pages are spaced out (FIRST_GAP_SECONDS, doubling each time, up to
+# SLOWEST_GAP_SECONDS) and the page is opened once more; after each read the gap shrinks again. Links from
+# other sites carry on at full speed meanwhile.
+FIRST_GAP_SECONDS = env_num("FIRST_GAP_SECONDS", 20.0)
+SLOWEST_GAP_SECONDS = env_num("SLOWEST_GAP_SECONDS", 300.0)
+GAP_AFTER_READ = 0.9  # each read shrinks the gap to 90%; under 5 s it's back to full speed
 
 REPO = os.path.abspath(env("REPO_DIR", "repo"))  # the results repo, checked out
 WORK = os.path.abspath(env("WORK_DIR", os.path.join(tempfile.gettempdir(), "link-opener")))
@@ -731,7 +739,7 @@ class Worker:
         if leftovers:  # a read that arrived late for an earlier link: keep it
             job.saver.add(leftovers, "")
             await self.forget(leftovers)
-        moves, second_look, reopened, full_retry = 0, False, False, False
+        moves, second_look, reopened, full_retry, second_read = 0, False, False, False, False
         while True:
             light = LIGHT and not job.light_off and site in self.passed and not full_retry
             try:
@@ -754,6 +762,11 @@ class Worker:
                     return None, reads
                 if light:
                     full_retry = True  # maybe skipping something stopped the read: try once in full
+                    continue
+                if not second_read:
+                    second_read = True  # slow this site down, then open the page once more before giving up
+                    job.slow_down(site, row)
+                    await job.site_turn(site)
                     continue
                 return "no read", {}
             if kind == "not_found":
@@ -794,6 +807,46 @@ class Job:
         self.bytes = 0
         self.by_type = {}
         self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0}
+        self.todo = []  # (row, link) still to open, in order
+        self.site_gap = {}  # site -> seconds kept between its pages (0 = full speed)
+        self.site_next = {}  # site -> earliest time its next page may be opened
+
+    def take(self):
+        """The next link whose site may be opened now: ((row, link), 0). If every site left is resting:
+        (None, seconds until the first one may go). If no links are left: (None, None)."""
+        now, soonest = time.time(), None
+        for i, (row, url) in enumerate(self.todo):
+            site = site_of(url)
+            ready = self.site_next.get(site, 0)
+            if ready <= now:
+                del self.todo[i]
+                self.site_next[site] = now + self.site_gap.get(site, 0)
+                return (row, url), 0
+            soonest = ready if soonest is None else min(soonest, ready)
+        return None, (None if soonest is None else soonest - now)
+
+    async def site_turn(self, site):
+        """Waits until this site's next page may be opened, then takes that turn."""
+        while not self.stop and time.time() < self.site_next.get(site, 0):
+            await asyncio.sleep(min(5, max(0.1, self.site_next[site] - time.time())))
+        self.site_next[site] = time.time() + self.site_gap.get(site, 0)
+
+    def slow_down(self, site, row):
+        old = self.site_gap.get(site, 0)
+        gap = min(SLOWEST_GAP_SECONDS, max(FIRST_GAP_SECONDS, old * 2))
+        if gap > old:
+            say(f"Row {row}: nothing to read yet - slowing down on that site to one page every {gap:.0f} s.")
+        self.site_gap[site] = gap
+        self.site_next[site] = max(self.site_next.get(site, 0), time.time() + gap)
+
+    def speed_up(self, site):
+        gap = self.site_gap.get(site, 0)
+        if gap:
+            gap *= GAP_AFTER_READ
+            if gap < 5:
+                gap = 0
+                say("Reads are coming back from that site - full speed on it again.")
+            self.site_gap[site] = gap
 
     def proxy_url(self, port):
         if not USE_PROXY:
@@ -820,7 +873,7 @@ def mark(job, row, link, status_text, count_try=True):
         r["tries"] += 1
 
 
-async def worker_loop(worker, queue, job):
+async def worker_loop(worker, job):
     while not job.stop:
         if LIMIT and job.taken >= LIMIT:
             return
@@ -831,10 +884,13 @@ async def worker_loop(worker, queue, job):
             await asyncio.sleep(min(5, max(0.1, job.pause_until - time.time())))
         if job.stop:
             return
-        try:
-            row, url = queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return
+        item, wait = job.take()
+        if item is None:
+            if wait is None:
+                return
+            await asyncio.sleep(min(5, max(0.1, wait)))  # every site left is resting
+            continue
+        row, url = item
         job.taken += 1
         try:
             kind, reads = await worker.lookup(row, url)
@@ -846,6 +902,7 @@ async def worker_loop(worker, queue, job):
 
         if kind is None:
             job.stats["read"] += 1
+            job.speed_up(site_of(url))
             job.blocks_in_a_row = job.errors_in_a_row = 0
             mark(job, row, url, "read", count_try=False)  # counted once it's saved
             job.saver.add(reads, url)
@@ -855,6 +912,8 @@ async def worker_loop(worker, queue, job):
             bucket = ("blocked" if kind in BLOCK_KINDS else "not found" if kind == "not_found"
                       else "no read" if kind == "no read" else "error")
             job.stats[bucket] += 1
+            if bucket == "no read":
+                job.slow_down(site_of(url), row)
             mark(job, row, url, status_name(kind))
             say(f"Row {row}: {status_name(kind)}.")
             job.errors_in_a_row = job.errors_in_a_row + 1 if bucket == "error" else 0
@@ -953,14 +1012,12 @@ async def open_links():
     check_key()
     if USE_PROXY:
         await check_proxy(job)
-    queue = asyncio.Queue()
-    for item in todo:
-        queue.put_nowait(item)
+    job.todo = list(todo)
     want = min(LIMIT, len(todo)) if LIMIT else len(todo)
     count = max(1, min(BROWSERS, want, len(job.ports.free) if USE_PROXY else BROWSERS))
     workers = [Worker(i + 1, job) for i in range(count)]
     say(f"Starting {count} browser(s) with the extension" + (" through Decodo." if USE_PROXY else " without a proxy."))
-    tasks = [asyncio.create_task(worker_loop(w, queue, job)) for w in workers]
+    tasks = [asyncio.create_task(worker_loop(w, job)) for w in workers]
     try:
         waiting = set(tasks)
         while waiting:  # if one browser hits a problem, the others finish their link and stop too
