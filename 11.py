@@ -86,6 +86,7 @@ BATCH = env_num("BATCH", 100 if os.environ.get("GITHUB_ACTIONS") else 25)
 
 READ_WAIT_SECONDS = env_num("READ_WAIT_SECONDS", 25)  # longest wait for the extension's first read
 SETTLE_SECONDS = env_num("SETTLE_SECONDS", 5)  # a read counts as finished after this long without changing
+LOAD_WAIT_SECONDS = env_num("LOAD_WAIT_SECONDS", 10)  # longest wait for a page's last pieces once its HTML is in
 LIGHT = env_bool("LIGHT", True)  # skip pictures, fonts, video and trackers (after each IP's first page)
 HEADLESS = env_bool("HEADLESS", False)  # 12.yml runs a hidden screen, so a "visible" browser works there
 MATCH_TIMEZONE = env_bool("MATCH_TIMEZONE", True)  # browser clock = the proxy IP's time zone
@@ -734,6 +735,41 @@ class Worker:
         except Exception as e:
             box["error"] = short(e)
 
+    @staticmethod
+    async def dont_wait_for_everything(page):
+        """Some pages never finish loading (one small piece hangs), although what your extension reads is there
+        long before. Waiting for the whole page made those a 60 s timeout, opened twice more, then an error.
+        Now a page counts as opened once its HTML is in, plus up to LOAD_WAIT_SECONDS for the rest; the
+        extension then has its usual time to read it."""
+        real_goto, real_wait = page.goto, page.wait_for_load_state
+
+        async def goto(url, **kwargs):
+            kwargs.setdefault("wait_until", "domcontentloaded")
+            return await real_goto(url, **kwargs)
+
+        async def wait_for_load_state(state=None, **kwargs):
+            if state in (None, "load", "networkidle"):
+                try:
+                    return await real_wait(state or "load", timeout=LOAD_WAIT_SECONDS * 1000)
+                except Exception as e:
+                    if type(e).__name__ != "TimeoutError":
+                        raise
+                    return None  # something on the page is still loading: carry on
+            return await real_wait(state, **kwargs)
+
+        page.goto, page.wait_for_load_state = goto, wait_for_load_state
+
+    async def read_anyway(self):
+        """After a page failed to open: the extension's read, if it got one regardless."""
+        try:
+            found = await self.reads()
+            if found:
+                await asyncio.sleep(SETTLE_SECONDS)  # let it finish
+                found = await self.reads() or found
+            return found or {}
+        except Exception:
+            return {}
+
     async def visit(self, url, light, patience=1):
         box = {}
 
@@ -741,7 +777,14 @@ class Worker:
             await self.wait_for_read(page, box, patience)
 
         await self.set_blocking(light)
-        page = await self.browser.fetch(url, page_action=action, google_search=False)
+        try:
+            page = await self.browser.fetch(url, page_action=action, page_setup=self.dont_wait_for_everything,
+                                            google_search=False)
+        except Exception:
+            reads = await self.read_anyway()
+            if reads:  # the page never finished, but the extension read it: that counts
+                return None, reads
+            raise
         if box.get("error"):  # couldn't check the extension's storage: the browser gets started again
             raise RuntimeError(box["error"])
         kind, reads = classify(page), box.get("reads") or {}
