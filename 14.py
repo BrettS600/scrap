@@ -15,6 +15,7 @@ in Terminal type  pbpaste > ~/decodo-isp-password.txt && chmod 600 ~/decodo-isp-
 press Enter yet; copy the password on Decodo's Proxy setup page, then press Enter. (A copied endpoint line,
 host:port:username:password, works too.) The inbox key is read from ~/card-inbox-key.txt, as for 13.py.
 Keep the Mac plugged in with the lid open. Stop with Ctrl+C: it finishes the pages in progress and saves.
+It also stops by itself when too many pages fail (STOP_AFTER_FAILURES below), or the site keeps blocking.
 
 The terminal, and the log in ~/scrap-private/isp-log.txt, only show row numbers and counts.
 """
@@ -24,6 +25,7 @@ LINKS_PER_START = 40  # the trial has 0.1 GB of data: 40 links, then it stops. 0
 BROWSERS = 3  # browser windows at once, each on its own address (up to 10)
 PAUSE_SECONDS = "3-8"  # wait between pages, in seconds, picked at random in this range
 RETRY_FAILED = False  # True = also try links that already failed 3 times
+STOP_AFTER_FAILURES = 15  # stops when this many of the last 30 pages failed (blocked, error, nothing read). 0 = never
 
 PASSWORD_FILE = "~/decodo-isp-password.txt"  # the ISP plan's proxy password, only on this Mac
 PROXY_HOST = "isp.decodo.com"
@@ -38,7 +40,6 @@ KEY_FILE = "~/card-inbox-key.txt"  # a GitHub key that can write to the inbox re
 FOLDER = "~/scrap-private"  # this Mac's copies, progress files and logs
 
 WAIT_AFTER_ERRORS_MINUTES = 10  # lots of errors in a row (the internet dropped?): wait, then carry on
-WAIT_AFTER_BLOCKS_MINUTES = 120  # the site keeps blocking: wait this long, then try again
 # -------------------------------------------
 
 import asyncio
@@ -295,7 +296,7 @@ def wait(minutes, why):
 
 
 def work_through_the_list():
-    error_stops = block_stops = 0
+    error_stops = 0
     while True:
         count_others_as_done()
         try:
@@ -308,6 +309,14 @@ def work_through_the_list():
         if job.why == "user":
             note("Stopped. Press Run again to carry on from here.")
             return
+        if job.why == "failing":
+            note("Stopped by itself: too many of the last pages failed. It's usually the site or the proxy having a "
+                 "bad patch. Press Run again later; it carries on from here.")
+            return
+        if job.why == "blocked":
+            note("Stopped by itself: the site kept blocking these addresses, even after pauses. Press Run again later; "
+                 "a longer PAUSE_SECONDS at the top of 14.py may help.")
+            return
         if LINKS_PER_START:
             note("Test done. If it looks fine, set LINKS_PER_START = 0 at the top of 14.py and press Run to work "
                  "through the list.")
@@ -317,20 +326,14 @@ def work_through_the_list():
             note("Every link on the list is done.")
             return
         progress = job.saver.saved > 0 or job.stats["not found"] > 0
-        if job.why == "blocked":
-            block_stops, error_stops = (block_stops + 1 if not progress else 1), 0
-            if block_stops >= 3:
-                raise Problem("The site kept blocking these addresses, even after long waits, so it has stopped for "
-                              "now. Press Run again later; a longer PAUSE_SECONDS at the top of 14.py may help.")
-            wait(WAIT_AFTER_BLOCKS_MINUTES, "The site is blocking these addresses for now")
-        elif job.why == "errors" or not progress:
-            error_stops, block_stops = (error_stops + 1 if not progress else 1), 0
-            if error_stops >= 6:
-                raise Problem("Still nothing but errors after about an hour. Check the internet connection and "
+        if job.why == "errors" or not progress:
+            error_stops = error_stops + 1 if not progress else 1
+            if error_stops >= 3:
+                raise Problem("Still nothing but errors after several tries. Check the internet connection and "
                               "Decodo's dashboard (is the plan active, with data left?). Then press Run.")
             wait(WAIT_AFTER_ERRORS_MINUTES, "Lots of errors in a row (maybe the internet dropped)")
         else:
-            error_stops = block_stops = 0
+            error_stops = 0
         refresh_copy(RESULTS_URL, CLONE, "your results-links repo", must=False)  # picks up new links
 
 
@@ -353,6 +356,7 @@ def main():
             "USE_PROXY": "true", "MATCH_TIMEZONE": "true", "LIGHT": "true", "HEADLESS": "false",
             "BROWSERS": str(BROWSERS), "PAUSE_SECONDS": PAUSE_SECONDS, "LIMIT": str(LINKS_PER_START),
             "RUN_MINUTES": "0", "RETRY_FAILED": "true" if RETRY_FAILED else "false",
+            "FAIL_WINDOW": "30", "FAIL_STOP": str(STOP_AFTER_FAILURES),
         })
         opener = load_opener(code)
         opener.setup_logging()
