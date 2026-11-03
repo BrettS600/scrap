@@ -1,6 +1,6 @@
 """
-13.py - works through your big list of links on this Mac, over your home internet, with no proxy, so
-it costs nothing.
+13.py - works through your big list of links on this Mac: over your home internet (free), or with
+USE_DECODO = True through your Decodo proxy, each browser on its own address (costs proxy data).
 
 It's the same link opener GitHub uses (11.py), run here instead. A browser window with your extension
 loaded opens each link, waits for Cloudflare's check and for your extension to read the page, then
@@ -14,6 +14,7 @@ Each time you press Run, it:
     first time, it counts the links your GitHub runs already saved as done.
 
 Before the first run: run 3.py once, and save your inbox key in ~/card-inbox-key.txt (see 1.md).
+For USE_DECODO, the proxy password is read from ~/decodo-password.txt (the file 6.py and 8.py use).
 Keep the Mac plugged in with the lid open. It won't sleep while this runs, and the screen stays on.
 Stop with Ctrl+C in the terminal: it finishes the page it's on and saves. Press Run again to carry on.
 
@@ -22,9 +23,15 @@ The terminal, and the log in ~/scrap-private/mac-log.txt, only show row numbers 
 
 # ---------------- settings ----------------
 LINKS_PER_START = 50  # the first test: 50 links, then it stops. 0 = keep going through the whole list.
-BROWSERS = 1  # browser windows at once. They all share your one home address, so start with 1.
+BROWSERS = 1  # browser windows at once. Without Decodo they all share your one home address, so start with 1.
 PAUSE_SECONDS = "3-8"  # wait between pages, in seconds, picked at random in this range
 RETRY_FAILED = False  # True = also try links that already failed 3 times
+
+USE_DECODO = False  # True = each browser goes out through its own Decodo address (up to 10 browsers); uses data
+PASSWORD_FILE = "~/decodo-password.txt"  # the Decodo proxy password, only on this Mac
+PROXY_HOST = "us.decodo.com"
+PROXY_PORTS = "10001-10010"  # each port is its own address, kept for 30 minutes
+PROXY_USER = "user-sp2e2o4qkx-sessionduration-30"
 
 RESULTS_REPO = "BrettS600/results-links"  # holds links.csv and your extension (cert-reader/)
 LINKS_FILE = "links.csv"
@@ -240,6 +247,21 @@ def set_up_key():
                   "your Mac'), then press Run again.")
 
 
+def set_up_decodo():
+    """Gives 11.py the Decodo password. 11.py checks Decodo accepts it before opening any links."""
+    path = os.path.expanduser(PASSWORD_FILE)
+    password = ""
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8-sig") as f:
+            password = f.read().strip()
+    if not password:
+        raise Problem(f"USE_DECODO is True, but there's no Decodo password in {PASSWORD_FILE}. Save it there (see 1.md), "
+                      "or set USE_DECODO = False to use your home internet.")
+    secrets.append(password)
+    os.environ.update({"DECODO_PASSWORD": password, "PROXY_HOST": PROXY_HOST, "PROXY_PORTS": PROXY_PORTS,
+                       "PROXY_USER": PROXY_USER})
+
+
 def keep_awake():
     if sys.platform == "darwin" and shutil.which("caffeinate"):
         subprocess.Popen(["caffeinate", "-d", "-i", "-s", "-w", str(os.getpid())])
@@ -304,10 +326,13 @@ def main():
         refresh_copy(RESULTS_URL, CLONE, "your results-links repo")
         start_progress()
         set_up_key()
+        if USE_DECODO:
+            set_up_decodo()
+        decodo = "true" if USE_DECODO else "false"
         os.environ.update({
             "REPO_DIR": CLONE, "LINKS_FILE": LINKS_FILE, "LINK_COLUMN": "0", "EXTENSION_FOLDER": EXTENSION_FOLDER,
             "INBOX_REPO": INBOX_REPO, "INBOX_FOLDER": "certs", "STATUS_FILE": PROGRESS, "WORK_DIR": WORK,
-            "USE_PROXY": "false", "MATCH_TIMEZONE": "false", "LIGHT": "false", "HEADLESS": "false",
+            "USE_PROXY": decodo, "MATCH_TIMEZONE": decodo, "LIGHT": decodo, "HEADLESS": "false",
             "BROWSERS": str(BROWSERS), "PAUSE_SECONDS": PAUSE_SECONDS, "LIMIT": str(LINKS_PER_START),
             "RUN_MINUTES": "0", "RETRY_FAILED": "true" if RETRY_FAILED else "false",
         })
@@ -315,7 +340,8 @@ def main():
         opener.setup_logging()
         keep_awake()
         note(f"{'Up to ' + str(LINKS_PER_START) + ' links this time' if LINKS_PER_START else 'The whole list'}, "
-             f"{BROWSERS} browser{'s' if BROWSERS != 1 else ''}, {PAUSE_SECONDS} s between pages.")
+             f"{BROWSERS} browser{'s' if BROWSERS != 1 else ''}, {PAUSE_SECONDS} s between pages, "
+             + ("through Decodo (each browser on its own address)." if USE_DECODO else "over your home internet."))
         work_through_the_list()
     except Problem as e:
         note(str(e))
