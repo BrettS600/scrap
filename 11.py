@@ -98,6 +98,11 @@ IP_CHECK_URL = env("IP_CHECK_URL", "https://ip.decodo.com/json")
 
 FIRST_BATCH = 5
 PORT_COOLDOWN_SECONDS = 600
+# A proxy address that stops getting through (a residential address whose owner went offline, say) is set aside
+# this long; a residential port gets a new address when its 30-minute session ends.
+DEAD_PORT_REST_SECONDS = 1800
+PROXY_FAILURES = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED",
+                  "CONNECT tunnel failed")
 BLOCKS_BEFORE_PAUSE = env_num("BLOCKS_BEFORE_PAUSE", 10)
 PAUSE_ALL_MINUTES = env_num("PAUSE_ALL_MINUTES", 15.0)
 PAUSES_BEFORE_STOP = env_num("PAUSES_BEFORE_STOP", 3)
@@ -550,7 +555,8 @@ class Ports:
         random.shuffle(ports)
         self.free, self.resting = ports, {}
 
-    async def take(self):
+    async def take(self, job=None):
+        said = False
         while True:
             now = time.time()
             for p, until in list(self.resting.items()):
@@ -559,15 +565,19 @@ class Ports:
                     self.free.append(p)
             if self.free:
                 return self.free.pop(0)
+            if job is not None and job.stop:
+                raise RuntimeError("stopping")
             wait = max(5, min(self.resting.values()) - now)
-            say(f"All proxy ports are resting after blocks - waiting {int(wait // 60)}m {int(wait % 60)}s.")
-            await asyncio.sleep(wait)
+            if not said:
+                say(f"All proxy ports are resting after blocks or failures - waiting {int(wait // 60)}m {int(wait % 60)}s.")
+                said = True
+            await asyncio.sleep(min(5, wait))
 
-    def give_back(self, port, blocked=False):
+    def give_back(self, port, blocked=False, rest=None):
         if port is None:
             return
         if blocked:
-            self.resting[port] = time.time() + PORT_COOLDOWN_SECONDS
+            self.resting[port] = time.time() + (rest or PORT_COOLDOWN_SECONDS)
         else:
             self.free.append(port)
 
@@ -597,36 +607,46 @@ class Worker:
         self.last_status = None  # the HTTP status of the last page, for messages
 
     async def ip_timezone(self):
+        """(time zone of this port's address or None, True if the proxy address itself didn't get through)."""
         from scrapling.fetchers import FetcherSession
 
         try:
             async with FetcherSession(retries=1, timeout=20, proxy=self.job.proxy_url(self.port)) as s:
                 r = await s.get(IP_CHECK_URL)
             info = json.loads((r.body or b"{}").decode("utf-8", "ignore"))
-            return (info.get("city") or {}).get("time_zone") or info.get("time_zone") or info.get("timezone")
-        except Exception:
-            return None
+            return (info.get("city") or {}).get("time_zone") or info.get("time_zone") or info.get("timezone"), False
+        except Exception as e:
+            text = str(e).lower()
+            return None, USE_PROXY and ("tunnel" in text or "proxy" in text)
 
-    async def open(self, new_ip=False):
+    async def open(self, new_ip=False, rest=None):
         from scrapling.fetchers import AsyncStealthySession
 
         await self.close()
         if USE_PROXY and (new_ip or self.port is None):
-            self.job.ports.give_back(self.port, blocked=new_ip)
-            self.port = await self.job.ports.take()
+            self.job.ports.give_back(self.port, blocked=new_ip, rest=rest)
+            self.port = await self.job.ports.take(self.job)
         self.passed.clear()
         folder = self.job.ext_folder
         options = dict(headless=HEADLESS, real_chrome=False, solve_cloudflare=True, hide_canvas=True, block_webrtc=True,
                        timeout=60000, retries=2, user_data_dir=self.profile,
                        extra_flags=[f"--disable-extensions-except={folder}", f"--load-extension={folder}"])
-        if USE_PROXY:
-            options["proxy"] = {"server": f"http://{PROXY_HOST}:{self.port}", "username": PROXY_USER, "password": PASSWORD}
         if MATCH_TIMEZONE:
-            tz = await self.ip_timezone()
+            tz, down = await self.ip_timezone()
+            for _ in range(3):  # this address isn't getting through (it may have gone offline): try another one
+                if not down:
+                    break
+                old = self.port
+                self.job.ports.give_back(old, blocked=True, rest=DEAD_PORT_REST_SECONDS)
+                self.port = await self.job.ports.take(self.job)
+                say(f"Browser {self.n}: port {old} isn't getting through - trying port {self.port}.")
+                tz, down = await self.ip_timezone()
             if tz:
                 options["timezone_id"] = tz
             say(f"Browser {self.n}: " + (f"port {self.port}, " if USE_PROXY else "")
                 + (f"clock set to {tz}." if tz else "couldn't look up its time zone, using the default."))
+        if USE_PROXY:
+            options["proxy"] = {"server": f"http://{PROXY_HOST}:{self.port}", "username": PROXY_USER, "password": PASSWORD}
         self.browser = AsyncStealthySession(**options)
         await self.browser.start()
         ctx = self.browser.context
@@ -813,13 +833,20 @@ class Worker:
         if leftovers:  # a read that arrived late for an earlier link: keep it
             job.saver.add(leftovers, "")
             await self.forget(leftovers)
-        moves, second_look, reopened, full_retry = 0, False, False, False
+        moves, second_look, reopened, full_retry, proxy_moves = 0, False, False, False, 0
         while True:
             light = LIGHT and not job.light_off and site in self.passed and not full_retry
             try:
                 kind, reads = await self.visit(url, light, patience)
             except Exception as e:
                 kind, reads = "error", {}
+                if USE_PROXY and proxy_moves < 3 and not job.stop and any(f in str(e) for f in PROXY_FAILURES):
+                    proxy_moves += 1  # the proxy address stopped getting through, not the site: use another one
+                    old = self.port
+                    await self.open(new_ip=True, rest=DEAD_PORT_REST_SECONDS)
+                    say(f"Row {row}: the proxy address on port {old} isn't getting through - Browser {self.n} moved "
+                        f"to port {self.port}.")
+                    continue
                 say(f"Row {row}: browser error ({short(e)}).")
             if kind is None:
                 self.passed.add(site)
@@ -1098,20 +1125,24 @@ def report(job, final=False):
 
 
 async def check_proxy(job):
+    """Checks Decodo accepts the password, on up to 3 ports (one address may be offline)."""
     from scrapling.fetchers import FetcherSession
 
-    try:
-        async with FetcherSession(retries=2, timeout=30, proxy=job.proxy_url(job.ports.free[0])) as s:
-            r = await s.get(IP_CHECK_URL)
-        status, problem = r.status, ""
-    except Exception as e:
-        status, problem = (407 if "407" in str(e) else None), short(e)
-    if status == 407:
-        raise Stop("Decodo turned down the proxy login: either the password is wrong or the plan is out of data. Check "
-                   "Decodo's dashboard, the DECODO_PASSWORD secret and PROXY_USER in 12.yml. No links were tried.")
-    if status is None:
-        raise Stop(f"Couldn't reach the Decodo proxy ({problem}). No links were tried; the next run tries again.")
-    say("Proxy password accepted." if status == 200 else f"The proxy answered (status {status}); carrying on.")
+    problem = ""
+    for port in job.ports.free[:3]:
+        try:
+            async with FetcherSession(retries=1, timeout=30, proxy=job.proxy_url(port)) as s:
+                r = await s.get(IP_CHECK_URL)
+            status = r.status
+        except Exception as e:
+            status, problem = (407 if "407" in str(e) else None), short(e)
+        if status == 407:
+            raise Stop("Decodo turned down the proxy login: either the password is wrong or the plan is out of data. "
+                       "Check Decodo's dashboard, the DECODO_PASSWORD secret and PROXY_USER in 12.yml. No links were tried.")
+        if status is not None:
+            say("Proxy password accepted." if status == 200 else f"The proxy answered (status {status}); carrying on.")
+            return
+    raise Stop(f"Couldn't reach the Decodo proxy ({problem}). No links were tried; the next run tries again.")
 
 
 def check_key():
