@@ -108,6 +108,13 @@ FULL_LOADS_BEFORE_LIGHT_OFF = 3
 #    empty -> seconds between its pages), so one odd page barely matters and the pace recovers as reads return.
 # Links from other sites carry on at full speed meanwhile.
 SECOND_LOOK_AFTER = env_num("SECOND_LOOK_AFTER", 60.0)
+# A page that says there have been too many lookups ("Your search activity has exceeded our limits") means the
+# site has cut this address off for a while. That site is then left alone completely (SITE_REST_MINUTES, doubling
+# each time it's still cut off, up to SITE_REST_MAX_MINUTES); its links wait in line without using up a try.
+SITE_REST_MINUTES = env_num("SITE_REST_MINUTES", 15.0)
+SITE_REST_MAX_MINUTES = env_num("SITE_REST_MAX_MINUTES", 120.0)
+LIMIT_WORDS = ("exceeded our limits", "exceeded the limit", "too many requests", "too many searches",
+               "rate limit exceeded", "you are being rate limited")
 SITE_WINDOW = 10
 SITE_GAPS = ((5, 180.0), (3, 60.0), (2, 20.0))  # 5+ of the last 10 empty: one page every 3 min; and so on
 
@@ -508,6 +515,15 @@ def classify(page):
     return None
 
 
+def says_limited(page):
+    """True if the page's visible text says there have been too many lookups."""
+    try:
+        text = str(page.get_all_text(separator=" ")).lower()
+    except Exception:
+        text = (page.body or b"")[:300000].decode("utf-8", "ignore").lower()
+    return any(w in text for w in LIMIT_WORDS)
+
+
 def site_of(url):
     host = (urlparse(url).hostname or "").lower()
     return host[4:] if host.startswith("www.") else host
@@ -725,7 +741,10 @@ class Worker:
         page = await self.browser.fetch(url, page_action=action, google_search=False)
         if box.get("error"):  # couldn't check the extension's storage: the browser gets started again
             raise RuntimeError(box["error"])
-        return classify(page), box.get("reads") or {}
+        kind, reads = classify(page), box.get("reads") or {}
+        if kind is None and not reads and says_limited(page):
+            kind = "rate_limit"
+        return kind, reads
 
     async def lookup(self, row, url, patience=1):
         """(status, reads). status None = read by the extension. patience 2 = wait twice as long for the read."""
@@ -803,12 +822,14 @@ class Job:
         self.why = None  # why it stopped early: "errors", "blocked", "user" or "problem"
         self.bytes = 0
         self.by_type = {}
-        self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0}
+        self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0, "limited": 0}
         self.todo = []  # (row, link) still to open, in order
         self.site_gap = {}  # site -> seconds kept between its pages (0 = full speed)
         self.site_next = {}  # site -> earliest time its next page may be opened
         self.site_log = {}  # site -> its last SITE_WINDOW outcomes (True = read)
         self.second_looks = {}  # link -> earliest time for its second look
+        self.site_rest = {}  # site -> minutes of its last rest (doubles while it keeps limiting this address)
+        self.site_rest_until = {}  # site -> time its rest ends
 
     def take(self, second_looks_only=False):
         """The next link that may be opened now: ((row, link), 0). If every one left has to wait:
@@ -818,7 +839,7 @@ class Job:
             if second_looks_only and url not in self.second_looks:
                 continue
             site = site_of(url)
-            ready = max(self.site_next.get(site, 0), self.second_looks.get(url, 0))
+            ready = max(self.site_next.get(site, 0), self.site_rest_until.get(site, 0), self.second_looks.get(url, 0))
             if ready <= now:
                 del self.todo[i]
                 self.site_next[site] = now + self.site_gap.get(site, 0)
@@ -830,6 +851,18 @@ class Job:
         """A page with nothing to read: back in the line for a second look later."""
         self.second_looks[url] = time.time() + SECOND_LOOK_AFTER
         self.todo.insert(0, (row, url))
+
+    def rest_site(self, site, row, url):
+        """The site says there have been too many lookups: leave it alone for a while. The link waits in line."""
+        now = time.time()
+        self.todo.insert(0, (row, url))
+        if now < self.site_rest_until.get(site, 0):  # already resting (another browser found out first)
+            return
+        rest = min(SITE_REST_MAX_MINUTES, self.site_rest[site] * 2) if self.site_rest.get(site) else SITE_REST_MINUTES
+        self.site_rest[site] = rest
+        self.site_rest_until[site] = now + rest * 60
+        say(f"Row {row}: that site says there have been too many lookups from this address - leaving it alone "
+            f"for {rest:g} min. Its links wait their turn (no tries used); other sites carry on.")
 
     def outcome(self, site, row, read):
         """Notes whether a page from this site had something to read, and sets the site's pace from that."""
@@ -848,7 +881,9 @@ class Job:
             else:
                 say("Reads are coming back from that site - full speed on it again.")
         self.site_gap[site] = gap
-        if not read:
+        if read:
+            self.site_rest.pop(site, None)  # the next cut-off starts again from the shortest rest
+        else:
             self.site_next[site] = max(self.site_next.get(site, 0), time.time() + gap)
 
     def proxy_url(self, port):
@@ -906,6 +941,15 @@ async def worker_loop(worker, job):
             kind, reads = "error", {}
             say(f"Row {row}: {short(e)}")
 
+        if kind == "rate_limit" and not USE_PROXY:
+            job.stats["limited"] += 1
+            job.second_looks.pop(url, None)
+            if not second:
+                job.taken -= 1  # it's opened again later and counted then
+            job.outcome(site_of(url), row, False)
+            job.rest_site(site_of(url), row, url)
+            await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
+            continue
         if kind == "no read" and not second:
             job.outcome(site_of(url), row, False)
             job.look_again(row, url)
@@ -960,6 +1004,8 @@ def report(job, final=False):
     line = (f"{'Done' if final else 'So far'}: {s['read']} read by the extension, {job.saver.saved} saved, "
             f"{s['no read']} no read, {s['blocked']} blocked, {s['error']} errors, {s['not found']} not found - "
             f"{mins:.0f} min.{data}")
+    if s["limited"]:
+        line += f" The site said 'too many lookups' {s['limited']} time{'s' if s['limited'] != 1 else ''}."
     say(line)
     if final and USE_PROXY and pages and job.by_type:
         top = sorted(job.by_type.items(), key=lambda kv: -kv[1])[:6]
