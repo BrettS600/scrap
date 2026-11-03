@@ -22,7 +22,8 @@ The log only ever shows row numbers and counts - never links, page text or what 
 Settings come from the env: section of 12.yml; the defaults are below. 13.py runs this same code on
 your Mac instead (home internet, no proxy) for the big list.
 
-Ctrl+C (or cancelling the run) finishes the page in progress and saves before stopping.
+Ctrl+C (or cancelling the run) finishes the pages in progress and saves before stopping. Pressed twice, it
+closes the browsers at once and still saves what's been read.
 
 By hand:  python 11.py plan | open
 """
@@ -80,7 +81,8 @@ INBOX_REPO = env("INBOX_REPO", "BrettS600/card-inbox")  # where reads are saved
 INBOX_FOLDER = env("INBOX_FOLDER", "certs")  # folder in that repo
 KEY = os.environ.get("CARD_INBOX_KEY", "").strip()  # GitHub key that can write to INBOX_REPO; never printed
 KEY_WHERE = env("KEY_WHERE", "the CARD_INBOX_KEY secret")  # where that key is kept, for messages
-BATCH = env_num("BATCH", 100)  # reads per save (the first save of a run is after 5, to check the key early)
+# reads per save (the first save of a run is after 5, to check the key early); 25 on the Mac, so a hard stop loses little
+BATCH = env_num("BATCH", 100 if os.environ.get("GITHUB_ACTIONS") else 25)
 
 READ_WAIT_SECONDS = env_num("READ_WAIT_SECONDS", 25)  # longest wait for the extension's first read
 SETTLE_SECONDS = env_num("SETTLE_SECONDS", 5)  # a read counts as finished after this long without changing
@@ -383,7 +385,8 @@ def git(args, cwd=None, timeout=600):
     # With a key in the address, keep git's saved-login helper out of it, so the key is never stored
     # (on a Mac it would otherwise go into the Keychain in place of your own GitHub login).
     pre = ["-c", "credential.helper="] if KEY and not INBOX_URL else []
-    r = subprocess.run(["git"] + pre + args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env_)
+    r = subprocess.run(["git"] + pre + args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env_,
+                       start_new_session=True)  # (so Ctrl+C can't cut a save off halfway)
     return r.returncode, mask((r.stdout or "") + (r.stderr or ""))
 
 
@@ -788,6 +791,8 @@ class Worker:
             if kind == "not_found":
                 return kind, {}
             if kind == "error":
+                if job.stop:
+                    return "stopped", {}
                 if not reopened:
                     reopened = True
                     await self.open()
@@ -797,7 +802,7 @@ class Worker:
                 second_look = True
                 await asyncio.sleep(random.uniform(4, 8))
                 continue
-            if USE_PROXY and moves < 2:
+            if USE_PROXY and moves < 2 and not job.stop:
                 moves, second_look = moves + 1, False
                 old = self.port
                 await self.open(new_ip=True)
@@ -940,6 +945,8 @@ async def worker_loop(worker, job):
         except Exception as e:
             kind, reads = "error", {}
             say(f"Row {row}: {short(e)}")
+        if kind == "stopped" or (job.stop and kind == "error"):
+            return  # cut off by stopping: it's opened again next time, without using a try
 
         if kind == "rate_limit" and not USE_PROXY:
             job.stats["limited"] += 1
@@ -1041,7 +1048,29 @@ def check_key():
     say("Inbox key accepted.")
 
 
+DRIVERS = []  # the browser drivers' processes, so a second Ctrl+C can close the browsers at once
+
+
+def keep_browsers_out_of_ctrl_c():
+    """Ctrl+C in a terminal goes to every program started from it, so it used to close the browsers mid-page
+    (and the pages they were on were lost). The browser driver now runs on its own: Ctrl+C reaches only this
+    script, which finishes the pages in progress, saves and closes the browsers itself."""
+    if os.name != "posix" or getattr(asyncio.create_subprocess_exec, "own_session", False):
+        return
+    real = asyncio.create_subprocess_exec
+
+    async def exec_on_its_own(*args, **kwargs):
+        kwargs.setdefault("start_new_session", True)
+        proc = await real(*args, **kwargs)
+        DRIVERS.append(proc)
+        return proc
+
+    exec_on_its_own.own_session = True
+    asyncio.create_subprocess_exec = exec_on_its_own
+
+
 async def open_links():
+    keep_browsers_out_of_ctrl_c()
     todo, links, status = plan()
     if not todo:
         output(more="false")
@@ -1055,14 +1084,23 @@ async def open_links():
     folder, page = find_extension()
     job = Job(status, folder, page)
     loop = asyncio.get_running_loop()
+    presses = []
 
     def ask_stop():
+        presses.append(1)
         job.stop, job.why = True, "user"
-        say("Stopping: finishing the page in progress and saving. Press Ctrl+C again to stop at once.")
-        try:
-            loop.remove_signal_handler(signal.SIGINT)
-        except Exception:
-            pass
+        if len(presses) == 1:
+            say("Stopping: finishing the pages in progress and saving. Press Ctrl+C again to close the browsers now.")
+        elif len(presses) == 2:
+            say("Closing the browsers now and saving what's been read. Press Ctrl+C again to quit without saving.")
+            for proc in DRIVERS:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        else:
+            say("Quit without saving the last reads; those links get opened again next time.")
+            os._exit(130)
 
     try:
         loop.add_signal_handler(signal.SIGINT, ask_stop)
