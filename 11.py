@@ -315,8 +315,14 @@ def plan(quiet=False):
 
 
 # ---------- the extension ----------
+# A blank page of our own, added to (the run's copy of) the extension's folder. A tab on it can read the
+# extension's storage like the popup can, but none of the popup's own code runs there (a popup may close
+# itself when it loses focus, for example). The popup is only used if this file can't be written.
+HELPER_PAGE = "link-opener.html"
+
+
 def find_extension():
-    """(folder, popup page) of the extension in the results repo."""
+    """(folder, page for reading its storage) of the extension in the results repo."""
     folder = os.path.join(REPO, EXTENSION_FOLDER)
     if not os.path.isfile(os.path.join(folder, "manifest.json")):
         found = []
@@ -336,7 +342,12 @@ def find_extension():
         raise Stop("The extension's manifest.json isn't valid JSON.")
     popup = ((manifest.get("action") or manifest.get("browser_action") or {}).get("default_popup")
              or (manifest.get("options_ui") or {}).get("page") or manifest.get("options_page") or "popup.html")
-    return folder, popup.lstrip("/")
+    try:
+        with open(os.path.join(folder, HELPER_PAGE), "w", encoding="utf-8") as f:
+            f.write("<!doctype html><meta charset=utf-8><title>Link opener</title>\n")
+        return folder, HELPER_PAGE
+    except OSError:
+        return folder, popup.lstrip("/")
 
 
 def extension_id(folder):
@@ -588,17 +599,17 @@ class Worker:
         for p in ctx.pages:
             await self.attach(p)
         ctx.on("page", lambda p: asyncio.ensure_future(self.attach(p)))
-        self.ext = await ctx.new_page()
-        url = f"chrome-extension://{self.job.ext_id}/{self.job.ext_popup}"
+        self.ext = None
         try:
-            await self.ext.goto(url, timeout=20000)
-            await self.ext.evaluate(JS_SETUP, isolated_context=False)
+            await self.storage(JS_SETUP)
         except Exception as e:
             ids = {w.url.split("/")[2] for w in ctx.service_workers if w.url.startswith("chrome-extension://")}
             if len(ids) == 1 and self.job.ext_id not in ids:
                 self.job.ext_id = ids.pop()
-                await self.ext.goto(f"chrome-extension://{self.job.ext_id}/{self.job.ext_popup}", timeout=20000)
-                await self.ext.evaluate(JS_SETUP, isolated_context=False)
+                if self.ext is not None:
+                    await self.ext.close()
+                self.ext = None
+                await self.storage(JS_SETUP)
             else:
                 raise Stop(f"The extension didn't load in the browser ({short(e)}). Check that its folder in this repo "
                            "is the whole extension, with manifest.json at its top.")
@@ -644,11 +655,30 @@ class Worker:
                 pass
             self.browser, self.ext = None, None
 
+    async def ext_tab(self):
+        """The tab used to read the extension's storage. If anything closed it, a new one is opened."""
+        if self.ext is not None and self.ext.is_closed():
+            say(f"Browser {self.n}: the extension's tab was closed - opening it again.")
+            self.ext = None
+        if self.ext is None:
+            self.ext = await self.browser.context.new_page()
+            await self.ext.goto(f"chrome-extension://{self.job.ext_id}/{self.job.ext_page}", timeout=20000)
+        return self.ext
+
+    async def storage(self, js, arg=None):
+        for attempt in range(2):
+            tab = await self.ext_tab()
+            try:
+                return await tab.evaluate(js, arg, isolated_context=False)
+            except Exception:
+                if attempt or not tab.is_closed():
+                    raise  # closed while we used it: open it once more
+
     async def reads(self):
-        return await self.ext.evaluate(JS_READS, isolated_context=False)
+        return await self.storage(JS_READS)
 
     async def forget(self, reads):
-        await self.ext.evaluate(JS_FORGET, [[k, r.get("read_at")] for k, r in reads.items()], isolated_context=False)
+        await self.storage(JS_FORGET, [[k, r.get("read_at")] for k, r in reads.items()])
 
     async def wait_for_read(self, page, box):
         """Runs after Cloudflare's check: waits until the extension has read the page and stopped changing."""
@@ -683,6 +713,8 @@ class Worker:
 
         await self.set_blocking(light)
         page = await self.browser.fetch(url, page_action=action, google_search=False)
+        if box.get("error"):  # couldn't check the extension's storage: the browser gets started again
+            raise RuntimeError(box["error"])
         return classify(page), box.get("reads") or {}
 
     async def lookup(self, row, url):
@@ -690,7 +722,12 @@ class Worker:
         job, site = self.job, site_of(url)
         if self.browser is None:
             await self.open()
-        leftovers = await self.reads()
+        try:
+            leftovers = await self.reads()
+        except Exception as e:
+            say(f"Row {row}: the browser stopped responding ({short(e)}) - starting it again.")
+            await self.open()
+            leftovers = await self.reads()
         if leftovers:  # a read that arrived late for an earlier link: keep it
             job.saver.add(leftovers, "")
             await self.forget(leftovers)
@@ -710,7 +747,10 @@ class Worker:
                         if job.full_needed >= FULL_LOADS_BEFORE_LIGHT_OFF and not job.light_off:
                             job.light_off = True
                             say("Your extension needs the full page on this site, so pages now load in full.")
-                    await self.forget(reads)
+                    try:
+                        await self.forget(reads)
+                    except Exception:
+                        pass  # the read is kept anyway; at worst it's saved twice
                     return None, reads
                 if light:
                     full_retry = True  # maybe skipping something stopped the read: try once in full
@@ -740,10 +780,10 @@ class Worker:
 
 
 class Job:
-    def __init__(self, status, folder, popup):
+    def __init__(self, status, folder, page):
         self.status = status
         self.ports = Ports(PROXY_PORTS) if USE_PROXY else None
-        self.ext_folder, self.ext_popup, self.ext_id = folder, popup, extension_id(folder)
+        self.ext_folder, self.ext_page, self.ext_id = folder, page, extension_id(folder)
         self.saver = Saver(status)
         self.light_off, self.full_needed = not LIGHT, 0
         self.blocks_in_a_row, self.errors_in_a_row, self.pauses, self.pause_until = 0, 0, 0, 0
@@ -894,8 +934,8 @@ async def open_links():
     if not KEY and not INBOX_URL:
         raise Stop("The CARD_INBOX_KEY secret isn't set: the GitHub key that can write to the inbox repo. In this repo: "
                    "Settings > Secrets and variables > Actions > New repository secret. No links were tried.")
-    folder, popup = find_extension()
-    job = Job(status, folder, popup)
+    folder, page = find_extension()
+    job = Job(status, folder, page)
     loop = asyncio.get_running_loop()
 
     def ask_stop():
