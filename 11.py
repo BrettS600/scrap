@@ -520,7 +520,7 @@ def classify(page):
     if status in (404, 410):
         return "not_found"
     if status is not None and status >= 500:
-        return "error"
+        return "site_error"  # the site's own server error (busy or overloaded); the browser is fine
     return None
 
 
@@ -594,6 +594,7 @@ class Worker:
         self.profile = os.path.join(WORK, f"browser-{n}")  # kept between restarts: the cache saves proxy data
         self.cdp = []  # one debugging session per tab, used to skip pictures, fonts, video and trackers
         self.blocking = False
+        self.last_status = None  # the HTTP status of the last page, for messages
 
     async def ip_timezone(self):
         from scrapling.fetchers import FetcherSession
@@ -792,6 +793,7 @@ class Worker:
             raise
         if box.get("error"):  # couldn't check the extension's storage: the browser gets started again
             raise RuntimeError(box["error"])
+        self.last_status = page.status
         kind, reads = classify(page), box.get("reads") or {}
         if kind is None and not reads and says_limited(page):
             kind = "rate_limit"
@@ -836,7 +838,7 @@ class Worker:
                     full_retry = True  # maybe skipping something stopped the read: try once in full
                     continue
                 return "no read", {}
-            if kind == "not_found":
+            if kind in ("not_found", "site_error"):  # (a server error isn't the browser's fault: no restart)
                 return kind, {}
             if kind == "error":
                 if job.stop:
@@ -928,7 +930,7 @@ class Job:
         gap = next((g for n, g in SITE_GAPS if empty >= n), 0.0)
         if gap != old:
             if gap > old:
-                say(f"Row {row}: {empty} of the last {len(log)} pages from that site came back empty - "
+                say(f"Row {row}: {empty} of the last {len(log)} pages from that site had nothing to read or an error - "
                     f"slowing down on it to one page every {gap:.0f} s.")
             elif gap:
                 say(f"Reads are coming back from that site - one page every {gap:.0f} s now.")
@@ -1017,6 +1019,17 @@ async def worker_loop(worker, job):
             job.rest_site(site_of(url), row, url)
             await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
             continue
+        if kind == "site_error":
+            if not second:  # the site is busy: this link goes back in line, and the site's pages slow down
+                job.outcome(site_of(url), row, False)
+                job.tally("error")
+                job.look_again(row, url)
+                say(f"Row {row}: the site answered with a server error ({worker.last_status}) - it gets another try "
+                    "in a minute or more.")
+                await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
+                continue
+            say(f"Row {row}: the site answered with a server error ({worker.last_status}) again.")
+            kind = "error"
         if kind == "no read" and not second:
             job.outcome(site_of(url), row, False)
             job.tally("no read")
@@ -1039,7 +1052,7 @@ async def worker_loop(worker, job):
                       else "no read" if kind == "no read" else "error")
             job.stats[bucket] += 1
             job.tally(bucket)
-            if bucket == "no read":
+            if bucket in ("no read", "error"):
                 job.outcome(site_of(url), row, False)
             mark(job, row, url, status_name(kind))
             say(f"Row {row}: {status_name(kind)}.")
