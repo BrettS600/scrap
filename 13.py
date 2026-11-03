@@ -4,7 +4,7 @@ USE_DECODO = True through your Decodo proxy, each browser on its own address (co
 
 It's the same link opener GitHub uses (11.py), run here instead. A browser window with your extension
 loaded opens each link, waits for Cloudflare's check and for your extension to read the page, then
-saves the reads to your inbox repo, 100 at a time.
+saves the reads to your inbox repo, 25 at a time.
 
 Each time you press Run, it:
   - gets the latest 11.py from GitHub (or uses the 11.py next to this file if GitHub can't be reached);
@@ -16,18 +16,24 @@ Each time you press Run, it:
 Before the first run: run 3.py once, and save your inbox key in ~/card-inbox-key.txt (see 1.md).
 For USE_DECODO, the proxy password is read from ~/decodo-password.txt (the file 6.py and 8.py use).
 Keep the Mac plugged in with the lid open. It won't sleep while this runs, and the screen stays on.
-Stop with Ctrl+C in the terminal: it finishes the page it's on and saves. Press Run again to carry on.
+Stop with Ctrl+C in the terminal: it finishes the pages it's on and saves; nothing already read is lost.
+Press Run again to carry on from there.
+
+It also stops by itself when too many pages fail (STOP_AFTER_FAILURES below), since a failed page still
+uses proxy data. With Decodo, it doesn't start again by itself after that, or after the site keeps
+blocking or the connection keeps failing: you press Run again later.
 
 The terminal, and the log in ~/scrap-private/mac-log.txt, only show row numbers and counts.
 """
 
 # ---------------- settings ----------------
-LINKS_PER_START = 50  # the first test: 50 links, then it stops. 0 = keep going through the whole list.
-BROWSERS = 1  # browser windows at once. Without Decodo they all share your one home address, so start with 1.
+LINKS_PER_START = 0  # 0 = keep going through the whole list. A number = that many links, then it stops.
+BROWSERS = 4  # browser windows at once. With Decodo each has its own address (up to 10).
 PAUSE_SECONDS = "3-8"  # wait between pages, in seconds, picked at random in this range
 RETRY_FAILED = False  # True = also try links that already failed 3 times
+STOP_AFTER_FAILURES = 15  # stops when this many of the last 30 pages failed (blocked, error, nothing read). 0 = never
 
-USE_DECODO = False  # True = each browser goes out through its own Decodo address (up to 10 browsers); uses data
+USE_DECODO = True  # True = each browser goes out through its own Decodo address (up to 10 browsers); uses data
 PASSWORD_FILE = "~/decodo-password.txt"  # the Decodo proxy password, only on this Mac
 PROXY_HOST = "us.decodo.com"
 PROXY_PORTS = "10001-10010"  # each port is its own address, kept for 30 minutes
@@ -287,6 +293,14 @@ def work_through_the_list():
         if job.why == "user":
             note("Stopped. Press Run again to carry on from here.")
             return
+        if job.why == "failing":
+            note("Stopped by itself: too many of the last pages failed, and each one still uses proxy data. It's "
+                 "usually the site or the proxy having a bad patch. Press Run again later; it carries on from here.")
+            return
+        if job.why == "blocked" and USE_DECODO:
+            note("Stopped by itself: the site kept blocking, even after pauses. Press Run again later; it carries on "
+                 "from here.")
+            return
         if LINKS_PER_START:
             note("Test done. If it looks fine, set LINKS_PER_START = 0 at the top of 13.py and press Run to work "
                  "through the whole list.")
@@ -305,9 +319,9 @@ def work_through_the_list():
             wait(WAIT_AFTER_BLOCKS_MINUTES, "The site is blocking this Mac for now")
         elif job.why == "errors" or not progress:
             error_stops, block_stops = (error_stops + 1 if not progress else 1), 0
-            if error_stops >= 6:
-                raise Problem("Still nothing but errors after about an hour. Check the internet connection; if that's "
-                              "fine, run 3.py again. Then press Run.")
+            if error_stops >= (3 if USE_DECODO else 6):
+                raise Problem("Still nothing but errors after several tries. Check the internet connection (and, with "
+                              "Decodo, its dashboard: is there data left?). Then press Run.")
             wait(WAIT_AFTER_ERRORS_MINUTES, "Lots of errors in a row (maybe the internet dropped)")
         else:
             error_stops = block_stops = 0
@@ -336,6 +350,7 @@ def main():
             "USE_PROXY": decodo, "MATCH_TIMEZONE": decodo, "LIGHT": decodo, "HEADLESS": "false",
             "BROWSERS": str(BROWSERS), "PAUSE_SECONDS": PAUSE_SECONDS, "LIMIT": str(LINKS_PER_START),
             "RUN_MINUTES": "0", "RETRY_FAILED": "true" if RETRY_FAILED else "false",
+            "FAIL_WINDOW": "30", "FAIL_STOP": str(STOP_AFTER_FAILURES),
         })
         opener = load_opener(code)
         opener.setup_logging()
