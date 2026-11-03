@@ -102,6 +102,11 @@ BLOCKS_BEFORE_PAUSE = env_num("BLOCKS_BEFORE_PAUSE", 10)
 PAUSE_ALL_MINUTES = env_num("PAUSE_ALL_MINUTES", 15.0)
 PAUSES_BEFORE_STOP = env_num("PAUSES_BEFORE_STOP", 3)
 ERRORS_BEFORE_STOP = 6
+# Each failed page still costs proxy data, so a run stops by itself once too many of its recent pages failed
+# (blocked, an error, or nothing for the extension to read): FAIL_STOP of the last FAIL_WINDOW. 0 = never.
+FAIL_WINDOW = env_num("FAIL_WINDOW", 30)
+FAIL_STOP = env_num("FAIL_STOP", 15)
+FAILED = ("blocked", "error", "no read")
 FULL_LOADS_BEFORE_LIGHT_OFF = 3
 # A site whose pages load but have nothing for the extension to read, while the data is there when you look
 # yourself, is usually holding its data back because its pages came too fast. So:
@@ -867,7 +872,8 @@ class Job:
         self.started = time.time()
         self.deadline = self.started + RUN_MINUTES * 60 if RUN_MINUTES > 0 else float("inf")
         self.taken, self.stop, self.out_of_time, self.problem = 0, False, False, None
-        self.why = None  # why it stopped early: "errors", "blocked", "user" or "problem"
+        self.why = None  # why it stopped early: "errors", "blocked", "failing", "user" or "problem"
+        self.recent = []  # the last FAIL_WINDOW outcomes: "read", "not found", "blocked", "error" or "no read"
         self.bytes = 0
         self.by_type = {}
         self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0, "limited": 0}
@@ -933,6 +939,17 @@ class Job:
             self.site_rest.pop(site, None)  # the next cut-off starts again from the shortest rest
         else:
             self.site_next[site] = max(self.site_next.get(site, 0), time.time() + gap)
+
+    def tally(self, what):
+        """Notes how a page went. Too many failures among the recent ones stops the run (they cost data)."""
+        self.recent.append(what)
+        del self.recent[:-max(1, FAIL_WINDOW)]
+        failed = [w for w in self.recent if w in FAILED]
+        if FAIL_STOP and len(failed) >= FAIL_STOP and not self.stop:
+            self.stop, self.why = True, "failing"
+            counts = ", ".join(f"{failed.count(k)} {k}" for k in FAILED if failed.count(k))
+            say(f"{len(failed)} of the last {len(self.recent)} pages failed ({counts}) - stopping, so data isn't "
+                "spent on failures.")
 
     def proxy_url(self, port):
         if not USE_PROXY:
@@ -1002,6 +1019,7 @@ async def worker_loop(worker, job):
             continue
         if kind == "no read" and not second:
             job.outcome(site_of(url), row, False)
+            job.tally("no read")
             job.look_again(row, url)
             say(f"Row {row}: nothing to read yet - it gets a second look in a minute or more.")
             await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
@@ -1009,6 +1027,7 @@ async def worker_loop(worker, job):
         job.second_looks.pop(url, None)
         if kind is None:
             job.stats["read"] += 1
+            job.tally("read")
             job.outcome(site_of(url), row, True)
             job.blocks_in_a_row = job.errors_in_a_row = 0
             mark(job, row, url, "read", count_try=False)  # counted once it's saved
@@ -1019,6 +1038,7 @@ async def worker_loop(worker, job):
             bucket = ("blocked" if kind in BLOCK_KINDS else "not found" if kind == "not_found"
                       else "no read" if kind == "no read" else "error")
             job.stats[bucket] += 1
+            job.tally(bucket)
             if bucket == "no read":
                 job.outcome(site_of(url), row, False)
             mark(job, row, url, status_name(kind))
