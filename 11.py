@@ -103,6 +103,12 @@ PORT_COOLDOWN_SECONDS = 600
 DEAD_PORT_REST_SECONDS = 1800
 PROXY_FAILURES = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED",
                   "CONNECT tunnel failed")
+# A page that didn't load (the connection was closed, it took too long...) is the site's or the network's doing,
+# not the browser's: the link gets another try later, and the browser isn't restarted (a restart opens a new
+# window on your screen, and its first pages load in full). Only a browser that's actually broken is restarted.
+PAGE_FAILURES = ("ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_TIMED_OUT",
+                 "ERR_TIMED_OUT", "ERR_EMPTY_RESPONSE", "ERR_SSL_PROTOCOL_ERROR", "ERR_HTTP2_PROTOCOL_ERROR",
+                 "ERR_QUIC_PROTOCOL_ERROR", "ERR_ABORTED", "Timeout")
 BLOCKS_BEFORE_PAUSE = env_num("BLOCKS_BEFORE_PAUSE", 10)
 PAUSE_ALL_MINUTES = env_num("PAUSE_ALL_MINUTES", 15.0)
 PAUSES_BEFORE_STOP = env_num("PAUSES_BEFORE_STOP", 3)
@@ -605,6 +611,7 @@ class Worker:
         self.cdp = []  # one debugging session per tab, used to skip pictures, fonts, video and trackers
         self.blocking = False
         self.last_status = None  # the HTTP status of the last page, for messages
+        self.last_problem = ""  # why the last page didn't load, for messages
 
     async def ip_timezone(self):
         """(time zone of this port's address or None, True if the proxy address itself didn't get through)."""
@@ -847,6 +854,11 @@ class Worker:
                     say(f"Row {row}: the proxy address on port {old} isn't getting through - Browser {self.n} moved "
                         f"to port {self.port}.")
                     continue
+                failure = next((f for f in PAGE_FAILURES if f in str(e)), None)
+                if failure and not job.stop:  # the page didn't load, but the browser is fine: no restart
+                    self.last_problem = ("it took too long" if failure == "Timeout"
+                                         else failure[4:].replace("_", " ").lower())
+                    return "page_error", {}
                 say(f"Row {row}: browser error ({short(e)}).")
             if kind is None:
                 self.passed.add(site)
@@ -1046,16 +1058,17 @@ async def worker_loop(worker, job):
             job.rest_site(site_of(url), row, url)
             await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
             continue
-        if kind == "site_error":
+        if kind in ("site_error", "page_error"):
+            why = (f"the site answered with a server error ({worker.last_status})" if kind == "site_error"
+                   else f"the page didn't load ({worker.last_problem})")
             if not second:  # the site is busy: this link goes back in line, and the site's pages slow down
                 job.outcome(site_of(url), row, False)
                 job.tally("error")
                 job.look_again(row, url)
-                say(f"Row {row}: the site answered with a server error ({worker.last_status}) - it gets another try "
-                    "in a minute or more.")
+                say(f"Row {row}: {why} - it gets another try in a minute or more.")
                 await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
                 continue
-            say(f"Row {row}: the site answered with a server error ({worker.last_status}) again.")
+            say(f"Row {row}: {why} again.")
             kind = "error"
         if kind == "no read" and not second:
             job.outcome(site_of(url), row, False)
