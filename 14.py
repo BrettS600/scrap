@@ -2,27 +2,30 @@
 14.py - works through your big list of links on this Mac through Decodo's ISP plan: 10 fixed addresses
 (one per port), unlimited data on the paid plan. Each browser goes out on its own address.
 
-It's 13.py's twin, made so the two can run at the same time without getting in each other's way:
-  - it works from the END of the list upward (13.py goes from the top down);
+It's 13.py's twin, the same in everything else (it runs the same 11.py, with the same automatic stops):
+  - it works from the END of the list upward (13.py goes from the top down), so both can run at once;
   - it has its own folders, progress file and log (all with "isp" in the name, in ~/scrap-private);
   - each time it starts a round, it counts the links 13.py and your GitHub runs already finished as done.
 
-Like 13.py, each time you press Run it gets the latest 11.py from GitHub, brings its own copy of your
-results-links repo up to date, and carries on from where it stopped.
+Like 13.py, each time you press Run (the ▷ in VS Code) it gets the latest 11.py from GitHub, brings its own
+copy of your results-links repo up to date, and carries on from where it stopped.
 
 Before the first run, save the ISP plan's proxy password on this Mac, the way you saved the inbox key:
 in Terminal type  pbpaste > ~/decodo-isp-password.txt && chmod 600 ~/decodo-isp-password.txt  but don't
 press Enter yet; copy the password on Decodo's Proxy setup page, then press Enter. (A copied endpoint line,
 host:port:username:password, works too.) The inbox key is read from ~/card-inbox-key.txt, as for 13.py.
-Keep the Mac plugged in with the lid open. Stop with Ctrl+C: it finishes the pages in progress and saves.
-It also stops by itself when too many pages fail (STOP_AFTER_FAILURES below), or the site keeps blocking.
+Keep the Mac plugged in with the lid open. Stop with Ctrl+C: it finishes the pages in progress and saves;
+nothing already read is lost. Press Run again to carry on from there.
+It also stops by itself (and saves) when too many pages fail (STOP_AFTER_FAILURES below), the site keeps
+blocking, or Decodo turns the login down (the trial's data ran out, say). It doesn't start again by itself
+after those: you press Run again later.
 
 The terminal, and the log in ~/scrap-private/isp-log.txt, only show row numbers and counts.
 """
 
 # ---------------- settings ----------------
 LINKS_PER_START = 40  # the trial has 0.1 GB of data: 40 links, then it stops. 0 = keep going through the list.
-BROWSERS = 3  # browser windows at once, each on its own address (up to 10)
+BROWSERS = 4  # browser windows at once, each on its own address (up to 10). 4 is what 13.py ran well with.
 PAUSE_SECONDS = "3-8"  # wait between pages, in seconds, picked at random in this range
 RETRY_FAILED = False  # True = also try links that already failed 3 times
 STOP_AFTER_FAILURES = 15  # stops when this many of the last 30 pages failed (blocked, error, nothing read). 0 = never

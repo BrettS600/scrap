@@ -103,6 +103,10 @@ PORT_COOLDOWN_SECONDS = 600
 DEAD_PORT_REST_SECONDS = 1800
 PROXY_FAILURES = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED",
                   "CONNECT tunnel failed")
+# Decodo turns the login down (407) when the password is wrong or the plan has no data left; then nothing gets through
+# on any port, so the run stops at once (and saves what's been read) instead of moving from port to port.
+PROXY_LOGIN_REFUSED = ("Decodo turned down the proxy login: either the password is wrong or the plan is out of data. "
+                       "Check Decodo's dashboard, the DECODO_PASSWORD secret and PROXY_USER in 12.yml.")
 # A page that didn't load (the connection was closed, it took too long...) is the site's or the network's doing,
 # not the browser's: the link gets another try later, and the browser isn't restarted (a restart opens a new
 # window on your screen, and its first pages load in full). Only a browser that's actually broken is restarted.
@@ -516,6 +520,8 @@ def classify(page):
     m = re.search(r"\berror(?: code)?:?\s*(10\d\d)\b", text) if "cloudflare" in text else None
     code = m.group(1) if m else ""
     headers = {k.lower(): v for k, v in (page.headers or {}).items()}
+    if status == 407:
+        return "error"  # the proxy turned the login down: the browser is started again, and that check stops the run
     if status == 429 or code == "1015" or "you are being rate limited" in text:
         return "rate_limit"
     if code in ("1005", "1006", "1007", "1008"):
@@ -620,10 +626,16 @@ class Worker:
         try:
             async with FetcherSession(retries=1, timeout=20, proxy=self.job.proxy_url(self.port)) as s:
                 r = await s.get(IP_CHECK_URL)
+            if USE_PROXY and r.status == 407:
+                raise Stop(PROXY_LOGIN_REFUSED)
             info = json.loads((r.body or b"{}").decode("utf-8", "ignore"))
             return (info.get("city") or {}).get("time_zone") or info.get("time_zone") or info.get("timezone"), False
+        except Stop:
+            raise
         except Exception as e:
             text = str(e).lower()
+            if USE_PROXY and "407" in text:  # the login stopped working mid-run (the plan ran out of data, say)
+                raise Stop(PROXY_LOGIN_REFUSED)
             return None, USE_PROXY and ("tunnel" in text or "proxy" in text)
 
     async def open(self, new_ip=False, rest=None):
@@ -1150,8 +1162,7 @@ async def check_proxy(job):
         except Exception as e:
             status, problem = (407 if "407" in str(e) else None), short(e)
         if status == 407:
-            raise Stop("Decodo turned down the proxy login: either the password is wrong or the plan is out of data. "
-                       "Check Decodo's dashboard, the DECODO_PASSWORD secret and PROXY_USER in 12.yml. No links were tried.")
+            raise Stop(PROXY_LOGIN_REFUSED + " No links were tried.")
         if status is not None:
             say("Proxy password accepted." if status == 200 else f"The proxy answered (status {status}); carrying on.")
             return
@@ -1257,11 +1268,10 @@ async def open_links():
             except Exception:
                 pass
             await w.close()
-        if job.problem is None:
-            try:
-                await job.saver.flush(force=True)
-            except Stop as e:
-                job.problem = str(e)
+        try:  # (also after a problem: saving doesn't go through the proxy, and a refused key just stops again)
+            await job.saver.flush(force=True)
+        except Stop as e:
+            job.problem = job.problem or str(e)
         unsaved = 0
         for r in status.values():
             if r["status"] == "read":
