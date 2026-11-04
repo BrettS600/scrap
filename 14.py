@@ -3,16 +3,17 @@
 (one per port), unlimited data on the paid plan. Each browser goes out on its own address.
 
 It's 13.py's twin, the same in everything else (it runs the same 11.py, with the same automatic stops):
-  - it works from the END of the list upward (13.py goes from the top down), so both can run at once;
+  - it goes down the list from the top, picking up where 13.py stopped (FROM_THE_END = True makes it go
+    from the bottom up instead, so it and 13.py can run at the same time without opening the same links);
   - it has its own folders, progress file and log (all with "isp" in the name, in ~/scrap-private);
   - each time it starts a round, it counts the links 13.py and your GitHub runs already finished as done.
 
 Like 13.py, each time you press Run (the ▷ in VS Code) it gets the latest 11.py from GitHub, brings its own
 copy of your results-links repo up to date, and carries on from where it stopped.
 
-Before the first run, save the ISP plan's proxy password on this Mac, the way you saved the inbox key:
-in Terminal type  pbpaste > ~/decodo-isp-password.txt && chmod 600 ~/decodo-isp-password.txt  but don't
-press Enter yet; copy the password on Decodo's Proxy setup page, then press Enter. (A copied endpoint line,
+Before the first run, save the ISP plan's proxy password on this Mac, in your home folder, as
+decodo-isp-password.txt: in TextEdit, New Document, Format > Make Plain Text, paste just the password, then
+Cmd+S, name it decodo-isp-password.txt, press Shift+Cmd+H (your home folder) and Save. (A copied endpoint line,
 host:port:username:password, works too.) The inbox key is read from ~/card-inbox-key.txt, as for 13.py.
 Keep the Mac plugged in with the lid open. Stop with Ctrl+C: it finishes the pages in progress and saves;
 nothing already read is lost. Press Run again to carry on from there.
@@ -29,6 +30,7 @@ BROWSERS = 4  # browser windows at once, each on its own address (up to 10). 4 i
 PAUSE_SECONDS = "3-8"  # wait between pages, in seconds, picked at random in this range
 RETRY_FAILED = False  # True = also try links that already failed 3 times
 STOP_AFTER_FAILURES = 15  # stops when this many of the last 30 pages failed (blocked, error, nothing read). 0 = never
+FROM_THE_END = False  # False = top of the list down. True = bottom up (only needed if 13.py runs at the same time)
 
 PASSWORD_FILE = "~/decodo-isp-password.txt"  # the ISP plan's proxy password, only on this Mac
 PROXY_HOST = "isp.decodo.com"
@@ -198,13 +200,14 @@ def load_opener(path):
     if not hasattr(mod, "setup_logging") or os.path.abspath(mod.STATUS_FILE) != os.path.abspath(PROGRESS):
         raise Problem("The 11.py it found is an older version that can't run on the Mac. Download the latest 11.py "
                       "from the scrap repo into the same folder as 14.py, then press Run again.")
-    real_plan = mod.plan
+    if FROM_THE_END:
+        real_plan = mod.plan
 
-    def plan_from_the_end(quiet=False):  # 13.py goes from the top down; this one goes from the bottom up
-        todo, links, status = real_plan(quiet)
-        return todo[::-1], links, status
+        def plan_from_the_end(quiet=False):  # 13.py goes from the top down; this goes from the bottom up
+            todo, links, status = real_plan(quiet)
+            return todo[::-1], links, status
 
-    mod.plan = plan_from_the_end
+        mod.plan = plan_from_the_end
     return mod
 
 
@@ -278,9 +281,9 @@ def set_up_proxy():
     if password.startswith(PROXY_HOST + ":") and password.count(":") >= 3:
         password = password.split(":", 3)[3]  # a whole copied endpoint line: host:port:username:password
     if not password:
-        raise Problem(f"There's no proxy password in {PASSWORD_FILE} yet. In Terminal type  pbpaste > "
-                      f"{PASSWORD_FILE} && chmod 600 {PASSWORD_FILE}  (don't press Enter yet), copy the password on "
-                      "Decodo's Proxy setup page, then press Enter. Then press Run again.")
+        raise Problem(f"There's no proxy password in {PASSWORD_FILE} yet. In TextEdit: New Document, Format > Make "
+                      "Plain Text, paste just the password, Cmd+S, name it decodo-isp-password.txt, press Shift+Cmd+H "
+                      "(your home folder) and Save. Then press Run again.")
     secrets.append(password)
     os.environ.update({"DECODO_PASSWORD": password, "PROXY_HOST": PROXY_HOST, "PROXY_PORTS": PROXY_PORTS,
                        "PROXY_USER": PROXY_USER})
@@ -365,7 +368,8 @@ def main():
         opener.setup_logging()
         keep_awake()
         note(f"{'Up to ' + str(LINKS_PER_START) + ' links this time' if LINKS_PER_START else 'The whole list'}, "
-             f"from the end of the list upward, {BROWSERS} browser{'s' if BROWSERS != 1 else ''}, "
+             f"{'from the end of the list upward' if FROM_THE_END else 'from the top of the list down'}, "
+             f"{BROWSERS} browser{'s' if BROWSERS != 1 else ''}, "
              f"{PAUSE_SECONDS} s between pages, through Decodo's ISP plan (each browser on its own address).")
         work_through_the_list()
     except Problem as e:
