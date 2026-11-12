@@ -31,6 +31,7 @@ By hand:  python 11.py plan | open
 import asyncio
 import csv
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -94,6 +95,19 @@ PAUSE_SECONDS = tuple(float(x) for x in (env("PAUSE_SECONDS", "1-3").split("-") 
 MAX_TRIES = env_num("MAX_TRIES", 3)  # a link that fails this many times is left alone
 RETRY_FAILED = env_bool("RETRY_FAILED", False)  # try links that already failed MAX_TRIES times again
 IP_CHECK_URL = env("IP_CHECK_URL", "https://ip.decodo.com/json")
+# With LINK_KEY set (a secret), the progress file keeps a scrambled code for each link instead of the link itself, so
+# it can be stored where others can see it (the scan list's progress is kept in the scrap repo). Without the secret
+# the codes can't be turned back into links. The same link always gets the same code, so it's still opened once.
+LINK_KEY = os.environ.get("LINK_KEY", "").strip()  # never printed
+# For the scan list, where reads should show up fast:
+#  - FAST_SAVE: one copy of the inbox (just its folder) stays open, and reads are saved in the background as soon as
+#    they come in (with BATCH 1: each read on its own, or together with whatever came in during the last save);
+#  - WATCH_MINUTES: once the list is done, the run stays open this long, checking the list every WATCH_EVERY seconds
+#    (after REFRESH_LINKS, a command that brings the links file up to date) and opening new links straight away.
+FAST_SAVE = env_bool("FAST_SAVE", False)
+WATCH_MINUTES = env_num("WATCH_MINUTES", 0.0)
+WATCH_EVERY = env_num("WATCH_EVERY", 25.0)
+REFRESH_LINKS = env("REFRESH_LINKS", "")
 # ---------------------------------------------------------------
 
 FIRST_BATCH = 5
@@ -163,7 +177,7 @@ TRACKERS = {
 # which made every page download the site's code again (2.4 MB a page in the first real run).
 BLOCK_PATTERNS = ([{"resourceType": t, "requestStage": "Request"} for t in ("Image", "Media", "Font")]
                   + [{"urlPattern": p, "requestStage": "Request"} for d in sorted(TRACKERS) for p in (f"*://{d}/*", f"*://*.{d}/*")])
-SECRETS = [s for s in (PASSWORD, KEY) if len(s) >= 6]  # (links with a password in them are hidden whole anyway)
+SECRETS = [s for s in (PASSWORD, KEY, LINK_KEY) if len(s) >= 6]  # (links with a password in them are hidden whole anyway)
 URL_RE = re.compile(r"""\b(?:https?|wss?|file)://[^\s"'<>)]+""", re.I)
 HOSTS_RE = None  # the hostnames in the links file, hidden from all output
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -328,6 +342,13 @@ def save_status(status):
     os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
 
 
+def key_of(link):
+    """How a link is recorded in the progress file: the link itself, or its scrambled code when LINK_KEY is set."""
+    if not LINK_KEY:
+        return link
+    return hmac.new(LINK_KEY.encode("utf-8"), link.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def is_done(r):
     if r is None:
         return False
@@ -345,9 +366,9 @@ def plan(quiet=False):
         return [], [], {}
     status = load_status()
     for row, link in links:  # keep row numbers current if rows moved
-        if link in status:
-            status[link]["row"] = row
-    todo = [(r, u) for r, u in links if not is_done(status.get(u))]
+        if key_of(link) in status:
+            status[key_of(link)]["row"] = row
+    todo = [(r, u) for r, u in links if not is_done(status.get(key_of(u)))]
     if not quiet:
         say(f"{len(links):,} links: {len(links) - len(todo):,} done, {len(todo):,} to go"
             + (f". This run opens up to {min(LIMIT, len(todo)):,}." if LIMIT and todo else "."))
@@ -464,6 +485,54 @@ def push_reads(records):
     return 0
 
 
+INBOX_COPY = os.path.join(WORK, "inbox-copy")
+
+
+def push_reads_fast(files):
+    """FAST_SAVE: saves the files through one copy of the inbox that stays open for the whole run. Only the repo's
+    structure is downloaded, never the reads already in it; when someone else saved in between, the copy catches up
+    and the save goes again. Returns how many were saved (0 = use the usual way)."""
+    folder, names = INBOX_COPY, [f"{INBOX_FOLDER}/{n}" for n, _ in files]
+    try:
+        if not os.path.isdir(os.path.join(folder, ".git")):
+            shutil.rmtree(folder, ignore_errors=True)
+            rc, out = git(["clone", "-q", "--depth", "1", "--filter=blob:none", "--sparse", inbox_url(), folder])
+            if rc != 0:
+                if any(w in out.lower() for w in AUTH_WORDS):
+                    raise Stop(f"GitHub turned down {KEY_WHERE}: it's wrong, expired, or can't write to {INBOX_REPO}.")
+                return 0
+            git(["sparse-checkout", "set", "--no-cone", f"/{INBOX_FOLDER}/.link-opener"], cwd=folder)  # check out nothing
+            git(["config", "user.name", "github-actions[bot]"], cwd=folder)
+            git(["config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], cwd=folder)
+        os.makedirs(os.path.join(folder, INBOX_FOLDER), exist_ok=True)
+        for name, data in files:
+            with open(os.path.join(folder, INBOX_FOLDER, name), "wb") as f:
+                f.write(data)
+        for attempt in range(5):
+            if git(["add", "--sparse", "--"] + names, cwd=folder)[0] != 0:
+                break
+            rc, out = git(["commit", "-q", "-m", f"{len(files)} read{'s' if len(files) != 1 else ''} from the link opener"],
+                          cwd=folder)
+            if rc != 0:
+                break
+            rc, out = git(["push", "-q", "origin", "HEAD"], cwd=folder)
+            if rc == 0:
+                return len(files)
+            if any(w in out.lower() for w in AUTH_WORDS):
+                raise Stop(f"GitHub turned down {KEY_WHERE}: it's wrong, expired, or can't write to {INBOX_REPO}.")
+            # someone else saved in between: take their latest, keep ours on top, and go again
+            if git(["fetch", "-q", "--depth", "1", "origin", "HEAD"], cwd=folder)[0] != 0 or \
+                    git(["reset", "-q", "FETCH_HEAD"], cwd=folder)[0] != 0:
+                break
+            time.sleep(min(20, 2 * (attempt + 1)))
+    except Stop:
+        raise
+    except Exception as e:
+        say(f"The quick save didn't work ({short(e)}); saving the usual way.")
+    shutil.rmtree(folder, ignore_errors=True)  # start a fresh copy next time
+    return 0
+
+
 class Saver:
     """Collects reads from all browsers and saves them in batches."""
 
@@ -474,6 +543,7 @@ class Saver:
         self.saved = 0
         self.saves = 0
         self.lock = asyncio.Lock()
+        self.task = None  # FAST_SAVE: the background save
 
     def add(self, reads, link):
         for key, rec in reads.items():
@@ -484,12 +554,16 @@ class Saver:
 
     async def flush(self, force=False):
         async with self.lock:
-            want = FIRST_BATCH if self.saves == 0 else BATCH
+            want = min(FIRST_BATCH, BATCH) if self.saves == 0 else BATCH
             if not self.pending or (not force and len(self.pending) < want):
                 return
             batch, links = dict(self.pending), {k: set(v) for k, v in self.links.items()}
             try:
-                n = await asyncio.to_thread(push_reads, batch)
+                n = await asyncio.to_thread(push_reads_fast, [f for i, rec in enumerate(batch.values())
+                                                              if (f := file_for(rec, int(time.time() * 1000) + i))]) \
+                    if FAST_SAVE else 0
+                if not n:
+                    n = await asyncio.to_thread(push_reads, batch)
             except Stop:
                 raise
             except Exception as e:
@@ -502,7 +576,7 @@ class Saver:
                 if self.pending.get(key) is batch[key]:
                     self.pending.pop(key, None)
                     for link in links.get(key, ()):
-                        r = self.status.get(link)
+                        r = self.status.get(key_of(link))
                         if r and r["status"] == "read":
                             r.update(status="saved", tries=r["tries"] + 1)
                     self.links.pop(key, None)
@@ -510,6 +584,27 @@ class Saver:
             self.saves += 1
             save_status(self.status)
             say(f"Saved {n} read{'s' if n != 1 else ''} to the inbox repo ({self.saved} this run).")
+
+    def soon(self, job):
+        """FAST_SAVE: starts a save in the background if one isn't going already. Reads that come in during a save go
+        into the next one, so the browsers never wait for saving."""
+        if self.task is None or self.task.done():
+            self.task = asyncio.ensure_future(self.save_all(job))
+
+    async def save_all(self, job):
+        fails = 0
+        try:
+            while self.pending and not job.stop and fails < 3:
+                before = self.saved
+                await self.flush(force=True)
+                if self.saved == before:  # didn't go through: try again a little later (the next read tries too)
+                    fails += 1
+                    await asyncio.sleep(15)
+                else:
+                    fails = 0
+        except Stop as e:
+            job.problem = job.problem or str(e)
+            job.stop, job.why = True, job.why or "problem"
 
 
 # ---------- pages ----------
@@ -937,6 +1032,13 @@ class Job:
         self.second_looks = {}  # link -> earliest time for its second look
         self.site_rest = {}  # site -> minutes of its last rest (doubles while it keeps limiting this address)
         self.site_rest_until = {}  # site -> time its rest ends
+        self.queued = set()  # links already put in line this run
+        self.last_busy = time.time()  # the last time a link was taken (WATCH_MINUTES counts from there)
+
+    def watching(self):
+        """WATCH_MINUTES: True while the run should stay open for new links."""
+        return (WATCH_MINUTES > 0 and not self.stop and time.time() < self.deadline
+                and time.time() - self.last_busy < WATCH_MINUTES * 60)
 
     def take(self, second_looks_only=False):
         """The next link that may be opened now: ((row, link), 0). If every one left has to wait:
@@ -1023,7 +1125,8 @@ class Job:
 
 
 def mark(job, row, link, status_text, count_try=True):
-    r = job.status.setdefault(link, {"row": row, "link": link, "status": "", "tries": 0, "time": "", "run": ""})
+    k = key_of(link)
+    r = job.status.setdefault(k, {"row": row, "link": k, "status": "", "tries": 0, "time": "", "run": ""})
     r.update(row=row, status=status_text, time=now_utc(), run=str(RUN_ID))
     if count_try:
         r["tries"] += 1
@@ -1043,10 +1146,11 @@ async def worker_loop(worker, job):
             return
         item, wait = job.take(only_second)
         if item is None:
-            if wait is None:
+            if wait is None and not job.watching():
                 return
-            await asyncio.sleep(min(5, max(0.1, wait)))  # everything left has to wait a little
+            await asyncio.sleep(min(5, max(0.1, wait if wait is not None else 2)))  # wait a little (or for new links)
             continue
+        job.last_busy = time.time()
         row, url = item
         second = url in job.second_looks
         if not second:
@@ -1098,7 +1202,10 @@ async def worker_loop(worker, job):
             mark(job, row, url, "read", count_try=False)  # counted once it's saved
             job.saver.add(reads, url)
             say(f"Row {row}: read by the extension ({len(reads)} read{'s' if len(reads) != 1 else ''}).")
-            await job.saver.flush()
+            if FAST_SAVE:
+                job.saver.soon(job)
+            else:
+                await job.saver.flush()
         else:
             bucket = ("blocked" if kind in BLOCK_KINDS else "not found" if kind == "not_found"
                       else "no read" if kind == "no read" else "error")
@@ -1179,6 +1286,45 @@ def check_key():
     say("Inbox key accepted.")
 
 
+def refresh_links():
+    """WATCH_MINUTES: brings the links file up to date with REFRESH_LINKS. Returns (ok, why not)."""
+    if not REFRESH_LINKS:
+        return True, ""
+    try:
+        r = subprocess.run(REFRESH_LINKS, shell=True, capture_output=True, text=True, timeout=90, start_new_session=True)
+    except subprocess.TimeoutExpired:
+        return False, "it took too long"
+    out = (r.stderr or r.stdout or "").strip().splitlines()
+    return r.returncode == 0, mask(out[-1][:150] if out else f"exit {r.returncode}")
+
+
+async def watch_list(job):
+    """WATCH_MINUTES: while the run is open, checks the links file every WATCH_EVERY seconds and puts new links in
+    line straight away (also while the earlier ones are still being opened)."""
+    complained = 0.0
+    while not job.stop:
+        await asyncio.sleep(WATCH_EVERY)
+        if job.stop:
+            return
+        ok, why = await asyncio.to_thread(refresh_links)
+        if not ok:
+            if time.time() - complained > 600:
+                complained = time.time()
+                say(f"Couldn't check the list for new links ({why}); trying again.")
+            continue
+        try:
+            links = read_links() or []
+        except Exception:
+            continue
+        new = [(r, u) for r, u in links if u not in job.queued and not is_done(job.status.get(key_of(u)))]
+        if new:
+            job.queued.update(u for _, u in new)
+            job.todo.extend(new)
+            job.last_busy = time.time()
+            say(f"{len(new)} new link{'s' if len(new) != 1 else ''} in the list - opening "
+                f"{'them' if len(new) != 1 else 'it'} now.")
+
+
 DRIVERS = []  # the browser drivers' processes, so a second Ctrl+C can close the browsers at once
 
 
@@ -1241,11 +1387,16 @@ async def open_links():
     if USE_PROXY:
         await check_proxy(job)
     job.todo = list(todo)
+    job.queued = {u for _, u in todo}
     want = min(LIMIT, len(todo)) if LIMIT else len(todo)
-    count = max(1, min(BROWSERS, want, len(job.ports.free) if USE_PROXY else BROWSERS))
+    count = max(1, min(BROWSERS, BROWSERS if WATCH_MINUTES > 0 else want, len(job.ports.free) if USE_PROXY else BROWSERS))
     workers = [Worker(i + 1, job) for i in range(count)]
     say(f"Starting {count} browser(s) with the extension" + (" through Decodo." if USE_PROXY else " without a proxy."))
     tasks = [asyncio.create_task(worker_loop(w, job)) for w in workers]
+    watcher = asyncio.create_task(watch_list(job)) if WATCH_MINUTES > 0 else None
+    if watcher:
+        say(f"Links added to the list during this run are opened too; it stays open {WATCH_MINUTES:g} min after the "
+            "last one.")
     try:
         waiting = set(tasks)
         while waiting:  # if one browser hits a problem, the others finish their link and stop too
@@ -1259,6 +1410,8 @@ async def open_links():
             elif e is not None:
                 say(f"A browser stopped with an error: {short(e)}")
     finally:
+        if watcher:
+            watcher.cancel()
         for w in workers:  # take any last reads before the browsers close
             try:
                 if w.ext is not None:
@@ -1268,6 +1421,11 @@ async def open_links():
             except Exception:
                 pass
             await w.close()
+        if job.saver.task is not None and not job.saver.task.done():  # let a background save finish
+            try:
+                await asyncio.wait_for(asyncio.shield(job.saver.task), 300)
+            except Exception:
+                pass
         try:  # (also after a problem: saving doesn't go through the proxy, and a refused key just stops again)
             await job.saver.flush(force=True)
         except Stop as e:
@@ -1284,7 +1442,11 @@ async def open_links():
         if job.out_of_time:
             say(f"Reached RUN_MINUTES ({RUN_MINUTES:g}); the rest wait for the next run.")
         summary([f"**Link opener** - {line}"])  # a stop reason is added by main()
-        left = sum(1 for _, u in links if not is_done(status.get(u)))
+        try:
+            links = (read_links() or links) if WATCH_MINUTES > 0 else links  # (new links may have come in)
+        except Exception:
+            pass
+        left = sum(1 for _, u in links if not is_done(status.get(key_of(u))))
         output(more=str(bool(left) and job.saver.saved > 0 and not job.problem).lower(),
                message=f"Opened links: {job.saver.saved} saved, {left} to go")
     if job.problem:
