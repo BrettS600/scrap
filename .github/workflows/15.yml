@@ -37,7 +37,7 @@ env:
   LIMIT: "0" # no limit per run
   RUN_MINUTES: "300" # a run stops after this long (GitHub's limit is 6 hours); the next one carries on
   KEEP_GOING: "true" # start the next run straight away if scans are left
-  WATCH_MINUTES: "15" # stay open this long after the last scan, checking for new ones
+  WATCH_MINUTES: "120" # stay open this long after the last scan, checking for new ones
   WATCH_EVERY: "25" # seconds between checks
   FAST_SAVE: "true" # save each read as soon as it's read
   BATCH: "1"
