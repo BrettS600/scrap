@@ -1,0 +1,203 @@
+# 15.yml (.github/workflows/15.yml) - opens the links you scan with Slab Show Scanner, straight after you scan them.
+#
+# Your server adds each scan to data/scans/scans.csv in card-data, then starts this workflow (the start signal in
+# scans.py). It fetches only that one file, opens the new links through your Decodo ISP plan in a browser with your
+# extension loaded, and saves each read to the scans/ folder of your inbox repo as soon as it's read (links.csv reads
+# stay in certs/). Once the list is done, it stays open 15 minutes and checks for new scans every 25 seconds, so at a
+# show new scans are picked up within half a minute. It also checks every 3 hours, in case a start signal was missed.
+#
+# A link is opened once: progress is kept in this repo as 16.csv, scrambled - each link is a code that can't be turned
+# back into the link without SCAN_SCRAMBLE_KEY. The logs (and the reports on the "Link opener reports" issue) only
+# show row numbers and counts.
+#
+# Secrets, in this repo: Settings > Secrets and variables > Actions > New repository secret
+#   CARD_READ_KEY       a GitHub key with Contents: Read on card-data and results-links (for scans.csv and the extension)
+#   CARD_INBOX_KEY      the GitHub key that can write to the inbox repo (the same key as before)
+#   DECODO_PASSWORD     the Decodo ISP plan's proxy password
+#   SCAN_SCRAMBLE_KEY   any long random text. Never change it: with a new one, every scan would be opened again.
+
+name: Scan opener
+
+on:
+  workflow_dispatch: # the start signal from your server (and "Run workflow" on the Actions tab)
+  schedule:
+    - cron: "41 */3 * * *" # every 3 hours, in case a start signal was missed
+
+concurrency:
+  group: scan-opener
+  cancel-in-progress: false # a new signal waits for the run that's open (which picks up new scans by itself anyway)
+
+permissions:
+  contents: write # save 16.csv
+  actions: write # start the next run
+  issues: write # post the report
+
+env:
+  BROWSERS: "4" # browsers at once, each on its own address
+  LIMIT: "0" # no limit per run
+  RUN_MINUTES: "300" # a run stops after this long (GitHub's limit is 6 hours); the next one carries on
+  KEEP_GOING: "true" # start the next run straight away if scans are left
+  WATCH_MINUTES: "15" # stay open this long after the last scan, checking for new ones
+  WATCH_EVERY: "25" # seconds between checks
+  FAST_SAVE: "true" # save each read as soon as it's read
+  BATCH: "1"
+  PAUSE_SECONDS: "1-3" # wait between pages, in seconds
+  READ_WAIT_SECONDS: "25"
+  SETTLE_SECONDS: "5"
+  LIGHT: "true" # skip pictures, fonts, video and trackers
+  USE_PROXY: "true"
+  PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 10 fixed addresses, one per port
+  PROXY_PORTS: "10001-10010"
+  PROXY_USER: "spdtx2m9da"
+  SCANS_REPO: "BrettS600/card-data"
+  SCANS_FILE: "data/scans/scans.csv" # the only file taken from card-data
+  EXTENSION_REPO: "BrettS600/results-links"
+  EXTENSION_FOLDER: "cert-reader" # the only folder taken from results-links
+  INBOX_REPO: "BrettS600/card-inbox"
+  INBOX_FOLDER: "scans" # scan reads go here
+  LINKS_FILE: "scans.csv"
+  LINK_COLUMN: "0"
+  REPO_DIR: work
+  STATUS_FILE: ${{ github.workspace }}/code/16.csv
+
+jobs:
+  open:
+    name: "Open new scans"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - name: Get the code and the progress
+        uses: actions/checkout@v4
+        with:
+          path: code
+      - name: Get scans.csv (only that file)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SCANS_REPO }}
+          ref: main
+          token: ${{ secrets.CARD_READ_KEY }}
+          path: scans-src
+          filter: blob:none
+          sparse-checkout: ${{ env.SCANS_FILE }}
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Plan
+        id: plan
+        env:
+          LINK_KEY: ${{ secrets.SCAN_SCRAMBLE_KEY }}
+        run: |
+          if [ -z "$LINK_KEY" ]; then
+            echo "The SCAN_SCRAMBLE_KEY secret isn't set, so progress can't be kept without the links showing. Add it and run again."
+            exit 1
+          fi
+          mkdir -p work
+          if [ -f "scans-src/$SCANS_FILE" ]; then cp "scans-src/$SCANS_FILE" work/scans.csv; fi
+          python code/11.py plan
+      - name: Get your extension (only its folder)
+        if: steps.plan.outputs.work == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.EXTENSION_REPO }}
+          token: ${{ secrets.CARD_READ_KEY }}
+          path: ext-src
+          filter: blob:none
+          sparse-checkout: ${{ env.EXTENSION_FOLDER }}
+          persist-credentials: false
+      - name: Put the extension in place
+        if: steps.plan.outputs.work == 'true'
+        run: cp -r "ext-src/$EXTENSION_FOLDER" "work/$EXTENSION_FOLDER"
+      - name: Keep the browser between runs
+        if: steps.plan.outputs.work == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/pip
+          key: scan-browser-${{ runner.os }}-scrapling-0.5-v1
+      - name: Install Scrapling and the browser
+        id: install
+        if: steps.plan.outputs.work == 'true'
+        run: |
+          set -o pipefail
+          {
+            python -m pip install -q "scrapling[fetchers]==0.5"
+            python -m patchright install --with-deps chromium > /dev/null
+            command -v xvfb-run > /dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+          } 2>&1 | tee "$RUNNER_TEMP/install.log"
+      - name: Open the scans
+        id: open
+        if: steps.plan.outputs.work == 'true'
+        env:
+          LINK_KEY: ${{ secrets.SCAN_SCRAMBLE_KEY }}
+          DECODO_PASSWORD: ${{ secrets.DECODO_PASSWORD }}
+          CARD_INBOX_KEY: ${{ secrets.CARD_INBOX_KEY }}
+          KEY_WHERE: "the CARD_INBOX_KEY secret in scrap"
+          # how the run checks for new scans while it's open: the latest scans.csv, that file only
+          REFRESH_LINKS: >-
+            git -C scans-src fetch -q --depth 1 origin main &&
+            git -C scans-src reset -q --hard FETCH_HEAD &&
+            cp "scans-src/$SCANS_FILE" work/scans.csv
+        run: |
+          set -o pipefail
+          xvfb-run -a -s "-screen 0 1920x1080x24" python code/11.py open 2>&1 | tee "$RUNNER_TEMP/opener.log"
+      - name: Save progress (scrambled)
+        id: save
+        if: always() && steps.plan.outputs.work == 'true'
+        working-directory: code
+        env:
+          MESSAGE: ${{ steps.open.outputs.message }}
+        run: |
+          if [ ! -f 16.csv ]; then echo "Nothing to save."; exit 0; fi
+          if grep -qiE "https?://|www\." 16.csv; then
+            echo "16.csv has links in it, so it isn't saved (SCAN_SCRAMBLE_KEY must be set)."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add 16.csv
+          if git diff --cached --quiet; then echo "Nothing new to save."; exit 0; fi
+          git commit -q -m "16.csv: ${MESSAGE:-scan progress}"
+          for i in 1 2 3 4 5; do
+            if git pull -q --rebase && git push -q; then echo "Progress saved."; exit 0; fi
+            git rebase --abort 2> /dev/null || true
+            sleep $((i * 10))
+          done
+          echo "Couldn't save 16.csv."
+          exit 1
+      - name: Start the next run
+        if: steps.open.outputs.more == 'true' && env.KEEP_GOING == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run 15.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          echo "Scans are left, so the next run is queued."
+      - name: Report
+        if: always() && (steps.plan.outputs.work == 'true' || failure())
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          STEPS: "plan: ${{ steps.plan.outcome }}, install: ${{ steps.install.outcome }}, open: ${{ steps.open.outcome }}, save progress: ${{ steps.save.outcome }}"
+        run: |
+          report="$RUNNER_TEMP/report.md"
+          {
+            echo "### Scan run $GITHUB_RUN_NUMBER: $RESULT ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            echo "Steps - $STEPS"
+            if [ -s "$RUNNER_TEMP/opener.log" ]; then
+              echo; echo "Log (last 40 lines; row numbers and counts only):"; echo '```'
+              grep -v "WARNING" "$RUNNER_TEMP/opener.log" | tail -n 40; echo '```'
+            fi
+            if [ "${{ steps.install.outcome }}" = "failure" ] && [ -s "$RUNNER_TEMP/install.log" ]; then
+              echo; echo "Install log (last 20 lines):"; echo '```'; tail -n 20 "$RUNNER_TEMP/install.log"; echo '```'
+            fi
+          } > "$report"
+          title="Link opener reports"
+          issue=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+          if [ -z "$issue" ]; then
+            issue=$(gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
+              --body "Each run adds a comment here: counts, step results and stop reasons only." | grep -o '[0-9]*$')
+          fi
+          gh issue comment "$issue" -R "$GITHUB_REPOSITORY" --body-file "$report" > /dev/null && echo "Report posted."
