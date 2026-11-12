@@ -4,16 +4,15 @@
 # (on GitHub: Add file > Create new file, type that name, paste, Commit changes).
 #
 # It runs on GitHub's computers, so it works with your laptop off. For each new link in your scan list
-# (scans.csv) it opens the page through your Decodo ISP plan in a browser with your extension loaded,
-# waits for the extension to read it, and saves the read to your inbox repo. Your big list (links.csv)
-# is done on your Mac by 14.py instead, so GitHub leaves it alone.
-# A run starts by itself as soon as scans.csv changes (new scans), every 6 hours to pick up anything
-# left over, or when you press "Run workflow" on the Actions tab. A link is opened once: progress is kept
-# in opened.csv, so links already read (or scanned twice) are skipped. If lots of scans come in at once,
-# runs follow one another until they're all done.
+# (scans.csv) it opens the page in a browser with your extension loaded (straight from GitHub when
+# USE_PROXY is "false"; through your Decodo proxy when it's "true"), waits for the extension to read
+# it, and saves the read to your inbox repo, 100 at a time. Your big list (links.csv) is done on your
+# Mac by 13.py instead, so GitHub leaves it alone.
+# A run starts by itself when a CSV or this file changes, every 6 hours to pick up anything
+# left over, or when you press "Run workflow" on the Actions tab. Progress is kept in opened.csv.
 #
-# Needs the repo secrets CARD_INBOX_KEY (a GitHub key that can write to the inbox repo) and
-# DECODO_PASSWORD (the Decodo ISP plan's proxy password). The code is 11.py in BrettS600/scrap.
+# Needs the repo secret CARD_INBOX_KEY (a GitHub key that can write to the inbox repo), and
+# DECODO_PASSWORD (the proxy password) when USE_PROXY is "true". The code is 11.py in BrettS600/scrap.
 # Optional third secret, SCRAP_REPORT_KEY (a GitHub key for BrettS600/scrap only, Issues: Read and
 # write): with it, every run posts a short report (counts, step results, stop reasons - no links)
 # as a comment on the "Link opener reports" issue in scrap, so the chat that built this can read it.
@@ -22,7 +21,7 @@ name: Link opener
 
 on:
   push:
-    paths: ["scans.csv", ".github/workflows/**"] # new scans (links.csv changes don't start a run)
+    paths: ["*.csv", "!opened.csv", ".github/workflows/**"]
   schedule:
     - cron: "23 */6 * * *"
   workflow_dispatch:
@@ -41,23 +40,23 @@ permissions:
   actions: write # start the next run
 
 env:
-  LIMIT: "0" # most links one run opens (0 = no limit; the ISP plan's data is unlimited)
-  USE_PROXY: "true" # "true" = through Decodo (the ISP plan below). "false" = straight from GitHub.
-  KEEP_GOING: "true" # "true" = start the next run straight away while links are left
+  LIMIT: "50" # most links one run opens (0 = no limit). Keep it small until you've seen the data use.
+  USE_PROXY: "false" # "false" = straight from GitHub, no Decodo. "true" = through Decodo.
+  KEEP_GOING: "false" # "true" = start the next run straight away while links are left
   BROWSERS: "2" # browsers at once (with the proxy, each on its own proxy IP)
   RUN_MINUTES: "300" # a run stops opening links after this long (GitHub's limit is 6 hours)
-  LINKS_FILE: "scans.csv" # the barcode-scan list. (The big list, links.csv, is done on your Mac by 14.py.)
+  LINKS_FILE: "scans.csv" # the barcode-scan list. (The big list, links.csv, is done on your Mac by 13.py.)
   LINK_COLUMN: "0" # 0 = the first web address in each row; or a column number or heading
   EXTENSION_FOLDER: "cert-reader" # the extension's folder in this repo
   INBOX_REPO: "BrettS600/card-inbox" # where the reads are saved
   INBOX_FOLDER: "certs"
-  BATCH: "25" # reads per save
+  BATCH: "100" # reads per save
   READ_WAIT_SECONDS: "25" # longest wait for the extension's first read of a page
   SETTLE_SECONDS: "5" # a read counts as finished after this long without changing
   LIGHT: "true" # skip pictures, fonts, video and trackers to save data
-  PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 10 fixed addresses, one per port
+  PROXY_HOST: "us.decodo.com"
   PROXY_PORTS: "10001-10010"
-  PROXY_USER: "spdtx2m9da"
+  PROXY_USER: "user-sp2e2o4qkx-sessionduration-30"
   CODE_REPO: "BrettS600/scrap"
   REPO_DIR: repo
 
