@@ -42,6 +42,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -108,6 +109,18 @@ FAST_SAVE = env_bool("FAST_SAVE", False)
 WATCH_MINUTES = env_num("WATCH_MINUTES", 0.0)
 WATCH_EVERY = env_num("WATCH_EVERY", 25.0)
 REFRESH_LINKS = env("REFRESH_LINKS", "")
+NEWEST_FIRST = env_bool("NEWEST_FIRST", WATCH_MINUTES > 0)  # the scan run: the slab scanned last is read first
+# A new show: you clear the list and start it over. Within a show the list only grows at the bottom, so when a link
+# with a record is gone from the list, or sits higher up in it than before, the list was started over: the records
+# are set aside and every link in it is opened again (a slab from an earlier show gets a fresh read).
+RESTART_ON_CLEAR = env_bool("RESTART_ON_CLEAR", WATCH_MINUTES > 0)
+# A second copy of every read, to share: SHARE_REPO gets the same files in SHARE_FOLDER, and its history is kept at one
+# entry with no message (each save replaces it), so all it shows is the reads. Only this run may write to that repo.
+SHARE_REPO = env("SHARE_REPO", "")
+SHARE_FOLDER = env("SHARE_FOLDER", INBOX_FOLDER)
+SHARE_KEY = os.environ.get("SHARE_KEY", "").strip()  # GitHub key that can write to SHARE_REPO; never printed
+SHARE_KEY_WHERE = env("SHARE_KEY_WHERE", "the SCAN_RESULTS_KEY secret")
+SHARE_NAME = env("SHARE_NAME", "scan results")  # the name its one entry shows
 # ---------------------------------------------------------------
 
 FIRST_BATCH = 5
@@ -153,11 +166,26 @@ SITE_REST_MAX_MINUTES = env_num("SITE_REST_MAX_MINUTES", 120.0)
 LIMIT_WORDS = ("exceeded our limits", "exceeded the limit", "too many requests", "too many searches",
                "rate limit exceeded", "you are being rate limited")
 SITE_WINDOW = 10
-SITE_GAPS = ((5, 180.0), (3, 60.0), (2, 20.0))  # 5+ of the last 10 empty: one page every 3 min; and so on
+
+
+def gaps(spec):
+    """'5:180,3:60' -> ((5, 180.0), (3, 60.0)): that many of the last SITE_WINDOW pages empty -> seconds between pages."""
+    out = []
+    for part in str(spec).replace(" ", "").split(","):
+        if ":" in part:
+            n, g = part.split(":", 1)
+            out.append((int(n), float(g)))
+    return tuple(sorted(out, reverse=True))
+
+
+# 5+ of the last 10 empty: one page every 3 min; and so on. The scan run eases off far less: scans include the odd
+# misread or made-up barcode whose page simply has nothing on it, and a show's scans shouldn't wait for those.
+SITE_GAPS = gaps(env("SITE_GAPS", "6:20" if WATCH_MINUTES > 0 else "5:180,3:60,2:20"))
 
 REPO = os.path.abspath(env("REPO_DIR", "repo"))  # the results repo, checked out
 WORK = os.path.abspath(env("WORK_DIR", os.path.join(tempfile.gettempdir(), "link-opener")))
 INBOX_URL = env("INBOX_URL", "")  # for testing; normally built from INBOX_REPO and KEY
+SHARE_URL = env("SHARE_URL", "")  # for testing; normally built from SHARE_REPO and SHARE_KEY
 RUN_ID = env_num("GITHUB_RUN_ID", int(time.time()))
 STATUS_FILE = os.path.join(REPO, env("STATUS_FILE", "opened.csv"))  # progress; a full path is used as it is
 
@@ -177,7 +205,7 @@ TRACKERS = {
 # which made every page download the site's code again (2.4 MB a page in the first real run).
 BLOCK_PATTERNS = ([{"resourceType": t, "requestStage": "Request"} for t in ("Image", "Media", "Font")]
                   + [{"urlPattern": p, "requestStage": "Request"} for d in sorted(TRACKERS) for p in (f"*://{d}/*", f"*://*.{d}/*")])
-SECRETS = [s for s in (PASSWORD, KEY, LINK_KEY) if len(s) >= 6]  # (links with a password in them are hidden whole anyway)
+SECRETS = [s for s in (PASSWORD, KEY, LINK_KEY, SHARE_KEY) if len(s) >= 6]  # (links with a password in them are hidden whole anyway)
 URL_RE = re.compile(r"""\b(?:https?|wss?|file)://[^\s"'<>)]+""", re.I)
 HOSTS_RE = None  # the hostnames in the links file, hidden from all output
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -357,6 +385,22 @@ def is_done(r):
     return (not RETRY_FAILED) and r["tries"] >= MAX_TRIES
 
 
+def list_restarted(links, status):
+    """RESTART_ON_CLEAR: True when the list was cleared and started over - a link with a record is gone from it, or
+    sits higher up than it did (within a show the list only grows at the bottom)."""
+    where = {}
+    for row, link in links:
+        k = key_of(link)
+        where[k] = max(where.get(k, 0), row)
+    return any(k not in where or (r.get("row") or 0) > where[k] for k, r in status.items())
+
+
+def start_over(status):
+    say(f"The list was cleared and started over (a new show), so every link in it is opened fresh "
+        f"({len(status):,} earlier record{'s' if len(status) != 1 else ''} set aside).")
+    status.clear()
+
+
 def plan(quiet=False):
     links = read_links()
     if links is None:
@@ -365,10 +409,14 @@ def plan(quiet=False):
                 "There's no links CSV in the repo's top folder yet. Upload it there and a run starts by itself.")
         return [], [], {}
     status = load_status()
+    if RESTART_ON_CLEAR and status and list_restarted(links, status):
+        start_over(status)
     for row, link in links:  # keep row numbers current if rows moved
         if key_of(link) in status:
             status[key_of(link)]["row"] = row
     todo = [(r, u) for r, u in links if not is_done(status.get(key_of(u)))]
+    if NEWEST_FIRST:
+        todo.reverse()
     if not quiet:
         say(f"{len(links):,} links: {len(links) - len(todo):,} done, {len(todo):,} to go"
             + (f". This run opens up to {min(LIMIT, len(todo)):,}." if LIMIT and todo else "."))
@@ -422,13 +470,14 @@ AUTH_WORDS = ("403", "401", "authentication failed", "could not read username", 
               "invalid username or password", "repository not found", "access denied", "write access")
 
 
-def git(args, cwd=None, timeout=600):
-    env_ = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+def git(args, cwd=None, timeout=600, stdin=None, extra=None):
+    env_ = dict(os.environ, GIT_TERMINAL_PROMPT="0", **(extra or {}))
     # With a key in the address, keep git's saved-login helper out of it, so the key is never stored
     # (on a Mac it would otherwise go into the Keychain in place of your own GitHub login).
-    pre = ["-c", "credential.helper="] if KEY and not INBOX_URL else []
+    pre = ["-c", "credential.helper="] if (KEY and not INBOX_URL) or (SHARE_KEY and not SHARE_URL) else []
+    feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}  # (git never waits for typing)
     r = subprocess.run(["git"] + pre + args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env_,
-                       start_new_session=True)  # (so Ctrl+C can't cut a save off halfway)
+                       start_new_session=True, **feed)  # (so Ctrl+C can't cut a save off halfway)
     return r.returncode, mask((r.stdout or "") + (r.stderr or ""))
 
 
@@ -446,14 +495,8 @@ def file_for(rec, ms):
     return f"{grader}_{cert}_{ms}.json", json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def push_reads(records):
-    """Saves {key: record} to the inbox repo in one commit. Returns how many were saved."""
-    ms = int(time.time() * 1000)
-    files = []
-    for i, rec in enumerate(records.values()):
-        f = file_for(rec, ms + i)
-        if f:
-            files.append(f)
+def push_reads(files):
+    """Saves the files [(name, bytes)] to the inbox repo in one commit. Returns how many were saved."""
     if not files:
         return 0
     os.makedirs(WORK, exist_ok=True)
@@ -533,6 +576,197 @@ def push_reads_fast(files):
     return 0
 
 
+# ---------- the copy to share (SHARE_REPO) ----------
+# Each save builds one new entry holding everything that was there plus the new reads, with no entry before it, and
+# puts it in place of the old one. Like the inbox copy above, only the repo's structure is downloaded, never the reads.
+SHARE_COPY = os.path.join(WORK, "share-copy")
+SHARE_LOCK = threading.Lock()  # one change to that repo at a time
+SHARE_REF, SHARE_TIP = "refs/heads/main", "refs/remotes/origin/main"
+SHARE_WHO = {"GIT_AUTHOR_NAME": SHARE_NAME, "GIT_AUTHOR_EMAIL": "scans@example.invalid",
+             "GIT_COMMITTER_NAME": SHARE_NAME, "GIT_COMMITTER_EMAIL": "scans@example.invalid"}
+SHARE_AUTH = re.compile(r"\b40[13]\b|authentication failed|could not read username|permission to|invalid username or "
+                        r"password|repository not found|access denied|write access", re.I)
+
+
+class ShareRefused(Exception):
+    pass
+
+
+def share_name():
+    return SHARE_REPO.rsplit("/", 1)[-1] or "the share repo"
+
+
+def share_url():
+    return SHARE_URL or f"https://x-access-token:{quote(SHARE_KEY, safe='')}@github.com/{SHARE_REPO}.git"
+
+
+def share_git(args, cwd=SHARE_COPY, timeout=120, **kw):
+    rc, out = git(args, cwd=cwd, timeout=timeout, **kw)
+    if rc != 0 and SHARE_AUTH.search(out):
+        raise ShareRefused(f"GitHub turned down {SHARE_KEY_WHERE}: it's wrong, expired, or can't write to "
+                           f"{share_name()}. Reads still go to the inbox repo.")
+    return rc, out
+
+
+def share_open():
+    """The kept-open copy of SHARE_REPO. Returns its latest entry ('' while the repo is empty)."""
+    if not os.path.isdir(os.path.join(SHARE_COPY, ".git")):
+        shutil.rmtree(SHARE_COPY, ignore_errors=True)
+        os.makedirs(WORK, exist_ok=True)
+        rc, out = share_git(["clone", "-q", "--depth", "1", "--filter=blob:none", "--no-checkout", share_url(),
+                             SHARE_COPY], cwd=WORK)
+        if rc != 0:
+            shutil.rmtree(SHARE_COPY, ignore_errors=True)
+            raise RuntimeError(out.strip()[:150] or "couldn't get a copy")
+    rc, out = share_git(["rev-parse", "-q", "--verify", SHARE_TIP + "^{commit}"])
+    return out.strip() if rc == 0 else ""
+
+
+def share_entry(base, entries):
+    """One new entry: base's files plus `entries` (index lines), with nothing before it. None if nothing changes."""
+    index = {"GIT_INDEX_FILE": os.path.join(SHARE_COPY, ".git", "share-index")}
+    try:
+        os.remove(index["GIT_INDEX_FILE"])
+    except FileNotFoundError:
+        pass
+    steps = [(["read-tree", base] if base else ["read-tree", "--empty"], None),
+             (["update-index", "--add", "--index-info"], entries)]
+    for args, stdin in steps:
+        rc, out = share_git(args, stdin=stdin, extra=index)
+        if rc != 0:
+            raise RuntimeError(out.strip()[:150])
+    rc, tree = share_git(["write-tree", "--missing-ok"], extra=index)  # (the reads already there aren't downloaded)
+    if rc != 0:
+        raise RuntimeError(tree.strip()[:150])
+    tree = tree.strip()
+    if base and share_git(["rev-parse", base + "^{tree}"])[1].strip() == tree:
+        return None
+    rc, out = share_git(["commit-tree", tree], stdin="", extra=SHARE_WHO)  # (no message)
+    if rc != 0:
+        raise RuntimeError(out.strip()[:150])
+    return out.strip()
+
+
+def share_save(files):
+    """Adds the files [(name, bytes)] to SHARE_FOLDER in SHARE_REPO, as one entry in place of the old one."""
+    if not files:
+        return
+    with SHARE_LOCK:
+        share_open()
+        stage = tempfile.mkdtemp(dir=WORK, prefix="share-")
+        try:
+            paths = []
+            for i, (_, data) in enumerate(files):
+                paths.append(os.path.join(stage, str(i)))
+                with open(paths[-1], "wb") as f:
+                    f.write(data)
+            rc, out = share_git(["hash-object", "-w", "--stdin-paths"], stdin="\n".join(paths) + "\n")
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        blobs = out.split()
+        if rc != 0 or len(blobs) != len(files):
+            raise RuntimeError(out.strip()[:150] or "couldn't store the files")
+        entries = "".join(f"100644 {b}\t{SHARE_FOLDER}/{name}\n" for b, (name, _) in zip(blobs, files))
+        for attempt in range(5):
+            base = share_open()
+            new = share_entry(base, entries)
+            if new is None:  # all there already
+                return
+            rc, out = share_git(["push", "-q", f"--force-with-lease={SHARE_REF}:{base}", "origin", f"{new}:{SHARE_REF}"])
+            if rc == 0:
+                share_git(["update-ref", SHARE_TIP, new])
+                return
+            # it changed on GitHub since (or this copy is behind): take the latest and build on that
+            rc2, out2 = share_git(["fetch", "-q", "--depth", "1", "origin", f"+{SHARE_REF}:{SHARE_TIP}"])
+            if rc2 != 0 and "couldn't find remote ref" in out2.lower():
+                share_git(["update-ref", "-d", SHARE_TIP])  # emptied: start it again
+            time.sleep(1 + attempt)
+        raise RuntimeError(out.strip()[:150] or "the save didn't go through")
+
+
+def share_sync():
+    """Copies the reads in the inbox folder that SHARE_REPO doesn't have yet (the first time: all of them).
+    Returns how many."""
+    with SHARE_LOCK:
+        base = share_open()
+        rc, out = share_git(["ls-tree", "--name-only", base, f"{SHARE_FOLDER}/"]) if base else (0, "")
+        have = {p.rsplit("/", 1)[-1] for p in out.splitlines()}
+    folder = tempfile.mkdtemp(dir=WORK, prefix="inbox-list-")
+    try:
+        rc, out = git(["clone", "-q", "--depth", "1", "--filter=blob:none", "--sparse", inbox_url(), folder])
+        if rc != 0:
+            raise RuntimeError(out.strip()[:150] or "couldn't look in the inbox repo")
+        rc, out = git(["ls-tree", "--name-only", "HEAD", f"{INBOX_FOLDER}/"], cwd=folder)
+        missing = [p for p in out.splitlines() if p.endswith(".json") and p.rsplit("/", 1)[-1] not in have]
+        if rc != 0 or not missing:
+            return 0
+        if git(["sparse-checkout", "set", INBOX_FOLDER], cwd=folder)[0] != 0:  # (downloads that folder only)
+            raise RuntimeError("couldn't get the inbox folder")
+        files = []
+        for p in missing:
+            try:
+                with open(os.path.join(folder, p), "rb") as f:
+                    files.append((p.rsplit("/", 1)[-1], f.read()))
+            except OSError:
+                pass
+        share_save(files)
+        return len(files)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+class Share:
+    """SHARE_REPO: copies reads there in the background once they're in the inbox repo, so it never holds a read up.
+    A copy that doesn't go through is made by the next run (it copies whatever the inbox has that the repo hasn't)."""
+
+    def __init__(self):
+        self.on = bool(SHARE_REPO) and bool(SHARE_KEY or SHARE_URL)
+        self.pending = []  # (name, bytes)
+        self.copied = 0
+        self.task = None
+
+    def start(self):
+        if SHARE_REPO and not self.on:
+            say(f"{SHARE_KEY_WHERE[0].upper() + SHARE_KEY_WHERE[1:]} isn't set yet, so reads only go to the inbox repo.")
+        if self.on:
+            self.task = asyncio.ensure_future(self.run(sync=True))
+
+    def add(self, files):
+        if self.on and files:
+            self.pending.extend(files)
+            if self.task is None or self.task.done():
+                self.task = asyncio.ensure_future(self.run())
+
+    async def run(self, sync=False):
+        try:
+            if sync:
+                try:
+                    n = await asyncio.to_thread(share_sync)
+                    if n:
+                        say(f"Copied {n} earlier read{'s' if n != 1 else ''} to {share_name()}.")
+                except ShareRefused:
+                    raise
+                except Exception as e:
+                    say(f"Couldn't copy earlier reads to {share_name()} ({short(e)}); the next run tries again.")
+            fails = 0
+            while self.pending and fails < 3:
+                batch, self.pending = self.pending, []
+                try:
+                    await asyncio.to_thread(share_save, batch)
+                    self.copied += len(batch)
+                    fails = 0
+                except ShareRefused:
+                    raise
+                except Exception as e:
+                    self.pending[:0] = batch
+                    fails += 1
+                    say(f"Copying to {share_name()} didn't go through ({short(e)}); trying again.")
+                    await asyncio.sleep(5 * fails)
+        except ShareRefused as e:
+            self.on = False
+            say(str(e))
+
+
 class Saver:
     """Collects reads from all browsers and saves them in batches."""
 
@@ -544,6 +778,7 @@ class Saver:
         self.saves = 0
         self.lock = asyncio.Lock()
         self.task = None  # FAST_SAVE: the background save
+        self.share = Share()  # SHARE_REPO: the copy to share
 
     def add(self, reads, link):
         for key, rec in reads.items():
@@ -558,12 +793,12 @@ class Saver:
             if not self.pending or (not force and len(self.pending) < want):
                 return
             batch, links = dict(self.pending), {k: set(v) for k, v in self.links.items()}
+            ms = int(time.time() * 1000)
+            files = [f for i, rec in enumerate(batch.values()) if (f := file_for(rec, ms + i))]
             try:
-                n = await asyncio.to_thread(push_reads_fast, [f for i, rec in enumerate(batch.values())
-                                                              if (f := file_for(rec, int(time.time() * 1000) + i))]) \
-                    if FAST_SAVE else 0
+                n = await asyncio.to_thread(push_reads_fast, files) if FAST_SAVE and files else 0
                 if not n:
-                    n = await asyncio.to_thread(push_reads, batch)
+                    n = await asyncio.to_thread(push_reads, files)
             except Stop:
                 raise
             except Exception as e:
@@ -582,6 +817,7 @@ class Saver:
                     self.links.pop(key, None)
             self.saved += n
             self.saves += 1
+            self.share.add(files)
             save_status(self.status)
             say(f"Saved {n} read{'s' if n != 1 else ''} to the inbox repo ({self.saved} this run).")
 
@@ -1248,6 +1484,8 @@ def report(job, final=False):
             f"{mins:.0f} min.{data}")
     if s["limited"]:
         line += f" The site said 'too many lookups' {s['limited']} time{'s' if s['limited'] != 1 else ''}."
+    if job.saver.share.on:
+        line += f" {job.saver.share.copied} copied to {share_name()}."
     say(line)
     if final and USE_PROXY and pages and job.by_type:
         top = sorted(job.by_type.items(), key=lambda kv: -kv[1])[:6]
@@ -1316,10 +1554,20 @@ async def watch_list(job):
             links = read_links() or []
         except Exception:
             continue
+        if RESTART_ON_CLEAR and job.status and list_restarted(links, job.status):
+            start_over(job.status)  # (the same records the saver keeps up to date)
+            current = {u for _, u in links}
+            job.todo = [(r, u) for r, u in job.todo if u in current]
+            job.queued = {u for _, u in job.todo}
+            for u in [u for u in job.second_looks if u not in current]:
+                del job.second_looks[u]
         new = [(r, u) for r, u in links if u not in job.queued and not is_done(job.status.get(key_of(u)))]
         if new:
             job.queued.update(u for _, u in new)
-            job.todo.extend(new)
+            if NEWEST_FIRST:
+                job.todo[:0] = new[::-1]  # ahead of the older ones still waiting
+            else:
+                job.todo.extend(new)
             job.last_busy = time.time()
             say(f"{len(new)} new link{'s' if len(new) != 1 else ''} in the list - opening "
                 f"{'them' if len(new) != 1 else 'it'} now.")
@@ -1384,6 +1632,7 @@ async def open_links():
     except (NotImplementedError, RuntimeError, ValueError):
         pass
     check_key()
+    job.saver.share.start()  # (catches up on earlier reads in the background while the browsers start)
     if USE_PROXY:
         await check_proxy(job)
     job.todo = list(todo)
@@ -1430,6 +1679,14 @@ async def open_links():
             await job.saver.flush(force=True)
         except Stop as e:
             job.problem = job.problem or str(e)
+        share = job.saver.share
+        if share.task is not None and not share.task.done():  # let the copy to share finish
+            try:
+                await asyncio.wait_for(asyncio.shield(share.task), 180)
+            except Exception:
+                pass
+        if share.on and share.pending:
+            say(f"{len(share.pending)} read(s) weren't copied to {share_name()} yet; the next run copies them.")
         unsaved = 0
         for r in status.values():
             if r["status"] == "read":
