@@ -3,16 +3,21 @@
 # Your server adds each scan to data/scans/scans.csv in card-data, then starts this workflow (the start signal in
 # scans.py). It fetches only that one file, opens the new links through your Decodo ISP plan in a browser with your
 # extension loaded, and saves each read to the scans/ folder of your inbox repo as soon as it's read (links.csv reads
-# stay in certs/). Once the list is done, it stays open 15 minutes and checks for new scans every 25 seconds, so at a
-# show new scans are picked up within half a minute. It also checks every 3 hours, in case a start signal was missed.
+# stay in certs/). Each read is also copied to scans/ in scan-results, whose history is kept at one entry with no
+# message, so that repo shows the reads and nothing else. Once the list is done, the run stays open 2 hours and checks
+# for new scans every 5 seconds. It also checks every 3 hours, in case a start signal was missed.
 #
-# A link is opened once: progress is kept in this repo as 16.csv, scrambled - each link is a code that can't be turned
-# back into the link without SCAN_SCRAMBLE_KEY. The logs (and the reports on the "Link opener reports" issue) only
-# show row numbers and counts.
+# A link is opened once per show: progress is kept in this repo as 16.csv, scrambled - each link is a code that can't
+# be turned back into the link without SCAN_SCRAMBLE_KEY. When you clear scans.csv for a new show, the run sees the
+# list was started over and opens every scan in it again, including slabs read at earlier shows. (So don't delete
+# single rows during a show: that looks like a new show too, and the rest of the list gets read again.) The logs (and
+# the reports on the "Link opener reports" issue) only show row numbers and counts.
 #
 # Secrets, in this repo: Settings > Secrets and variables > Actions > New repository secret
 #   CARD_READ_KEY       a GitHub key with Contents: Read on card-data and results-links (for scans.csv and the extension)
 #   CARD_INBOX_KEY      the GitHub key that can write to the inbox repo (the same key as before)
+#   SCAN_RESULTS_KEY    a GitHub key with Contents: Read and write on scan-results only (without it, reads only go to
+#                       the inbox repo)
 #   DECODO_PASSWORD     the Decodo ISP plan's proxy password
 #   SCAN_SCRAMBLE_KEY   any long random text. Never change it: with a new one, every scan would be opened again.
 
@@ -38,7 +43,8 @@ env:
   RUN_MINUTES: "300" # a run stops after this long (GitHub's limit is 6 hours); the next one carries on
   KEEP_GOING: "true" # start the next run straight away if scans are left
   WATCH_MINUTES: "120" # stay open this long after the last scan, checking for new ones
-  WATCH_EVERY: "25" # seconds between checks
+  WATCH_EVERY: "5" # seconds between checks
+  RESTART_ON_CLEAR: "true" # scans.csv cleared for a new show: open every scan in it again
   FAST_SAVE: "true" # save each read as soon as it's read
   BATCH: "1"
   PAUSE_SECONDS: "1-3" # wait between pages, in seconds
@@ -55,6 +61,8 @@ env:
   EXTENSION_FOLDER: "cert-reader" # the only folder taken from results-links
   INBOX_REPO: "BrettS600/card-inbox"
   INBOX_FOLDER: "scans" # scan reads go here
+  SHARE_REPO: "BrettS600/scan-results" # and a copy of each one here, history kept at one entry
+  SHARE_FOLDER: "scans"
   LINKS_FILE: "scans.csv"
   LINK_COLUMN: "0"
   REPO_DIR: work
@@ -134,6 +142,8 @@ jobs:
           DECODO_PASSWORD: ${{ secrets.DECODO_PASSWORD }}
           CARD_INBOX_KEY: ${{ secrets.CARD_INBOX_KEY }}
           KEY_WHERE: "the CARD_INBOX_KEY secret in scrap"
+          SHARE_KEY: ${{ secrets.SCAN_RESULTS_KEY }}
+          SHARE_KEY_WHERE: "the SCAN_RESULTS_KEY secret in scrap"
           # how the run checks for new scans while it's open: the latest scans.csv, that file only
           REFRESH_LINKS: >-
             git -C scans-src fetch -q --depth 1 origin main &&
