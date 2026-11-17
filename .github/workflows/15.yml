@@ -7,6 +7,8 @@
 # message, so that repo shows the reads and nothing else. Once the list is done, the run stays open 2 hours and checks
 # for new scans every 5 seconds. It also checks every 3 hours, in case a start signal was missed.
 #
+# It has ports 10001-10005 of the ISP plan to itself; the list run (17.yml) uses 10006-10010, so it never slows a scan.
+#
 # A link is opened once per show: progress is kept in this repo as 16.csv, scrambled - each link is a code that can't
 # be turned back into the link without SCAN_SCRAMBLE_KEY. When you clear scans.csv for a new show, the run sees the
 # list was started over and opens every scan in it again, including slabs read at earlier shows. (So don't delete
@@ -53,7 +55,7 @@ env:
   LIGHT: "true" # skip pictures, fonts, video and trackers
   USE_PROXY: "true"
   PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 10 fixed addresses, one per port
-  PROXY_PORTS: "10001-10010"
+  PROXY_PORTS: "10001-10005" # the scan run's 5; the list run (17.yml) has 10006-10010
   PROXY_USER: "spdtx2m9da"
   SCANS_REPO: "BrettS600/card-data"
   SCANS_FILE: "data/scans/scans.csv" # the only file taken from card-data
