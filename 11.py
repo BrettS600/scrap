@@ -114,6 +114,16 @@ NEWEST_FIRST = env_bool("NEWEST_FIRST", WATCH_MINUTES > 0)  # the scan run: the 
 # with a record is gone from the list, or sits higher up in it than before, the list was started over: the records
 # are set aside and every link in it is opened again (a slab from an earlier show gets a fresh read).
 RESTART_ON_CLEAR = env_bool("RESTART_ON_CLEAR", WATCH_MINUTES > 0)
+# Fixed proxy addresses (the ISP plan) and a long list (the list run: it watches its list but never starts it over):
+# when the site turns an address away ("too many lookups", or its security check won't let it through), that address
+# rests ADDRESS_REST_MINUTES - twice as long each time it's turned away again, up to ADDRESS_REST_MAX_MINUTES - instead
+# of the browser hopping straight to the next address. The link goes back in line without using a try, and when every
+# address is resting, the run waits for the first one back instead of stopping. 0 = hop to the next address (scans).
+ADDRESS_REST_MINUTES = env_num("ADDRESS_REST_MINUTES",
+                               30.0 if USE_PROXY and WATCH_MINUTES > 0 and not RESTART_ON_CLEAR else 0.0)
+ADDRESS_REST_MAX_MINUTES = env_num("ADDRESS_REST_MAX_MINUTES", 240.0)
+if ADDRESS_REST_MINUTES > 0:  # and at least the pace your Mac ran the big list at: 3-8 seconds between pages
+    PAUSE_SECONDS = (max(PAUSE_SECONDS[0], 3.0), max(PAUSE_SECONDS[1], 8.0))
 # A second copy of every read, to share: SHARE_REPO gets the same files in SHARE_FOLDER, and its history is kept at one
 # entry with no message (each save replaces it), so all it shows is the reads. Only this run may write to that repo.
 SHARE_REPO = env("SHARE_REPO", "")
@@ -191,6 +201,7 @@ STATUS_FILE = os.path.join(REPO, env("STATUS_FILE", "opened.csv"))  # progress; 
 
 CHALLENGE_TITLES = ("just a moment", "verify you are human", "attention required", "checking your browser")
 BLOCK_KINDS = {"challenge", "firewall", "fingerprint", "ip_ban", "rate_limit"}
+BLOCK_NAMES = {"challenge", "firewall", "fingerprint", "ip ban", "rate limit"}  # (as they're written in the progress)
 TRACKERS = {
     "google-analytics.com", "googletagmanager.com", "doubleclick.net", "googlesyndication.com",
     "googleadservices.com", "adservice.google.com", "connect.facebook.net", "facebook.net", "hotjar.com",
@@ -411,6 +422,10 @@ def plan(quiet=False):
     status = load_status()
     if RESTART_ON_CLEAR and status and list_restarted(links, status):
         start_over(status)
+    if ADDRESS_REST_MINUTES > 0:  # tries used up by earlier cut-offs don't count any more
+        for r in status.values():
+            if r["status"] in BLOCK_NAMES:
+                r.update(status="", tries=0)
     for row, link in links:  # keep row numbers current if rows moved
         if key_of(link) in status:
             status[key_of(link)]["row"] = row
@@ -897,6 +912,18 @@ class Ports:
                 ports.append(int(part))
         random.shuffle(ports)
         self.free, self.resting = ports, {}
+        self.turned_away = {}  # ADDRESS_REST: port -> minutes of its last rest
+
+    def rest_for(self, port):
+        """ADDRESS_REST: how many minutes this port rests now (twice as long while the site keeps turning it away)."""
+        last = self.turned_away.get(port)
+        minutes = min(ADDRESS_REST_MAX_MINUTES, last * 2) if last else ADDRESS_REST_MINUTES
+        self.turned_away[port] = minutes
+        return minutes
+
+    def welcome(self, port):
+        """A read came back on this port: its next rest starts from the shortest again."""
+        self.turned_away.pop(port, None)
 
     async def take(self, job=None):
         said = False
@@ -909,6 +936,9 @@ class Ports:
             if self.free:
                 return self.free.pop(0)
             if job is not None and job.stop:
+                raise RuntimeError("stopping")
+            if job is not None and now > job.deadline:  # (out of time while waiting: wrap up and save)
+                job.out_of_time, job.stop = True, True
                 raise RuntimeError("stopping")
             wait = max(5, min(self.resting.values()) - now)
             if not said:
@@ -1052,6 +1082,12 @@ class Worker:
             self.blocking = on
             for cdp in list(self.cdp):
                 await self.block(cdp, on)
+
+    async def rest_address(self, minutes):
+        """ADDRESS_REST: this browser's address rests; the browser starts again on the next free one when needed."""
+        await self.close()
+        self.job.ports.give_back(self.port, blocked=True, rest=minutes * 60)
+        self.port = None
 
     async def close(self):
         if self.browser is not None:
@@ -1234,6 +1270,8 @@ class Worker:
                 second_look = True
                 await asyncio.sleep(random.uniform(4, 8))
                 continue
+            if USE_PROXY and ADDRESS_REST_MINUTES > 0:
+                return kind, {}  # no hopping: this address rests and the link waits its turn (see worker_loop)
             if USE_PROXY and moves < 2 and not job.stop:
                 moves, second_look = moves + 1, False
                 old = self.port
@@ -1260,7 +1298,7 @@ class Job:
         self.recent = []  # the last FAIL_WINDOW outcomes: "read", "not found", "blocked", "error" or "no read"
         self.bytes = 0
         self.by_type = {}
-        self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0, "limited": 0}
+        self.stats = {"read": 0, "no read": 0, "blocked": 0, "error": 0, "not found": 0, "limited": 0, "turned away": 0}
         self.todo = []  # (row, link) still to open, in order
         self.site_gap = {}  # site -> seconds kept between its pages (0 = full speed)
         self.site_next = {}  # site -> earliest time its next page may be opened
@@ -1410,6 +1448,17 @@ async def worker_loop(worker, job):
             job.rest_site(site_of(url), row, url)
             await asyncio.sleep(random.uniform(*PAUSE_SECONDS))
             continue
+        if kind in BLOCK_KINDS and USE_PROXY and ADDRESS_REST_MINUTES > 0:
+            job.stats["turned away"] += 1
+            job.second_looks.pop(url, None)
+            if not second:
+                job.taken -= 1  # it's opened again later and counted then
+            job.todo.insert(0, (row, url))  # back in line, no try used
+            port, minutes = worker.port, job.ports.rest_for(worker.port)
+            await worker.rest_address(minutes)
+            say(f"Row {row}: the site turned away the address on port {port} ({status_name(kind)}) - that address "
+                f"rests {minutes:g} min; the link waits its turn (no try used).")
+            continue
         if kind in ("site_error", "page_error"):
             why = (f"the site answered with a server error ({worker.last_status})" if kind == "site_error"
                    else f"the page didn't load ({worker.last_problem})")
@@ -1433,6 +1482,8 @@ async def worker_loop(worker, job):
         if kind is None:
             job.stats["read"] += 1
             job.tally("read")
+            if job.ports is not None:
+                job.ports.welcome(worker.port)
             job.outcome(site_of(url), row, True)
             job.blocks_in_a_row = job.errors_in_a_row = 0
             mark(job, row, url, "read", count_try=False)  # counted once it's saved
@@ -1484,6 +1535,8 @@ def report(job, final=False):
             f"{mins:.0f} min.{data}")
     if s["limited"]:
         line += f" The site said 'too many lookups' {s['limited']} time{'s' if s['limited'] != 1 else ''}."
+    if s["turned away"]:
+        line += f" Addresses turned away by the site (and rested): {s['turned away']}."
     if job.saver.share.on:
         line += f" {job.saver.share.copied} copied to {share_name()}."
     say(line)
@@ -1720,12 +1773,28 @@ def setup_logging():
     logging.getLogger("scrapling").setLevel(logging.WARNING)
 
 
+def refresh_progress():
+    """On GitHub, a run that waited in line is handed this repo as it was when it was queued, so it would miss the
+    progress the run before it saved - it would read those links again, and then fail to save its own progress. So
+    the progress file's repo is brought up to date first."""
+    folder = os.path.dirname(STATUS_FILE)
+    if not os.environ.get("GITHUB_ACTIONS") or not os.path.isdir(os.path.join(folder, ".git")):
+        return
+    branch = os.environ.get("GITHUB_REF_NAME") or "main"
+    rc, out = git(["fetch", "-q", "--depth", "1", "origin", f"refs/heads/{branch}"], cwd=folder, timeout=120)
+    if rc == 0:
+        rc, out = git(["reset", "-q", "--hard", "FETCH_HEAD"], cwd=folder, timeout=60)
+    if rc != 0:
+        say(f"Couldn't bring the progress up to date ({out.strip()[:120]}); carrying on with this copy.")
+
+
 def main():
     what = sys.argv[1] if len(sys.argv) > 1 else ""
     if what not in ("plan", "open"):
         sys.exit("Use: python 11.py plan | open")
     if not os.path.isdir(REPO):
         sys.exit(f"Can't find the results repo folder ({REPO}).")
+    refresh_progress()
     try:
         if what == "plan":
             todo, _, _ = plan()
