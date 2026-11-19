@@ -131,6 +131,18 @@ SHARE_FOLDER = env("SHARE_FOLDER", INBOX_FOLDER)
 SHARE_KEY = os.environ.get("SHARE_KEY", "").strip()  # GitHub key that can write to SHARE_REPO; never printed
 SHARE_KEY_WHERE = env("SHARE_KEY_WHERE", "the SCAN_RESULTS_KEY secret")
 SHARE_NAME = env("SHARE_NAME", "scan results")  # the name its one entry shows
+# Several machines on one list (the list run): PARTS machines work side by side, and this one opens only the links in
+# share PART (1..PARTS). Every link belongs to exactly one share, so nothing is opened twice.
+PARTS = max(1, env_num("PARTS", 1))
+PART = min(max(1, env_num("PART", 1)), PARTS)
+# Their progress goes into one shared file (SHARED_STATUS, in this repo's checkout). Each machine keeps its own in
+# STATUS_FILE and merges it into the shared one every SHARE_STATUS_MINUTES and at the end - a finished link wins - so
+# the machines never overwrite each other. Only scrambled codes are ever saved there (it needs LINK_KEY).
+SHARED_STATUS = env("SHARED_STATUS", "")
+SHARE_STATUS_MINUTES = env_num("SHARE_STATUS_MINUTES", 10.0)
+# FAST_SAVE with several machines saving to the same repos: each saves at most once every SAVE_EVERY_SECONDS, with
+# whatever came in meanwhile in the same save. 0 = save each read straight away (the scan run).
+SAVE_EVERY_SECONDS = env_num("SAVE_EVERY_SECONDS", 0.0)
 # ---------------------------------------------------------------
 
 FIRST_BATCH = 5
@@ -361,10 +373,11 @@ def read_links():
 STATUS_COLS = ["row", "link", "status", "tries", "time", "run"]
 
 
-def load_status():
+def load_status(path=None):
+    path = path or STATUS_FILE
     status = {}
-    if os.path.exists(STATUS_FILE):
-        with open(STATUS_FILE, newline="", encoding="utf-8-sig", errors="replace") as f:
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
             for r in csv.DictReader(f):
                 if r.get("link"):
                     status[r["link"]] = {"row": to_int(r.get("row")), "link": r["link"], "status": r.get("status") or "",
@@ -372,13 +385,66 @@ def load_status():
     return status
 
 
-def save_status(status):
-    with open(STATUS_FILE + ".tmp", "w", newline="", encoding="utf-8") as f:
+def save_status(status, path=None):
+    path = path or STATUS_FILE
+    with open(path + ".tmp", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, STATUS_COLS)
         w.writeheader()
         for r in sorted(status.values(), key=lambda r: (r["row"], r["link"])):
             w.writerow({k: r.get(k, "") for k in STATUS_COLS})
-    os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
+    os.replace(path + ".tmp", path)
+
+
+def status_rank(r):
+    """Which of two records of the same link counts: a finished one, then the one with more tries, then the newer."""
+    return r.get("status") in ("saved", "not found"), to_int(r.get("tries")), r.get("time") or ""
+
+
+def merge_status(into, records):
+    for k, r in records.items():
+        if k not in into or status_rank(r) > status_rank(into[k]):
+            into[k] = r
+    return into
+
+
+def in_my_part(link):
+    """PARTS: True if this link is in this machine's share of the list."""
+    return PARTS <= 1 or int(hashlib.sha256(link.encode("utf-8")).hexdigest()[:8], 16) % PARTS == PART - 1
+
+
+SHARED_LOCK = threading.Lock()
+
+
+def push_shared_status(records):
+    """SHARED_STATUS: merges this machine's progress into the shared file and saves that to GitHub. True if saved."""
+    if not SHARED_STATUS or not LINK_KEY:  # (never save links themselves where others can see them)
+        return False
+    folder, name = os.path.dirname(os.path.abspath(SHARED_STATUS)), os.path.basename(SHARED_STATUS)
+    branch = os.environ.get("GITHUB_REF_NAME") or "main"
+    who = ["-c", "user.name=github-actions[bot]", "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+           "-c", "commit.gpgsign=false"]
+    out = ""
+    with SHARED_LOCK:
+        for attempt in range(8):
+            rc, out = git(["fetch", "-q", "--depth", "1", "origin", f"refs/heads/{branch}"], cwd=folder, timeout=120)
+            if rc == 0:
+                rc, out = git(["reset", "-q", "--hard", "FETCH_HEAD"], cwd=folder, timeout=60)
+            if rc != 0:
+                break
+            merged = merge_status(load_status(SHARED_STATUS), records)
+            save_status(merged, SHARED_STATUS)
+            git(["add", name], cwd=folder)
+            if git(["diff", "--cached", "--quiet"], cwd=folder)[0] == 0:
+                return True  # nothing new
+            done = sum(1 for r in merged.values() if r["status"] in ("saved", "not found"))
+            rc, out = git(who + ["commit", "-q", "-m", f"{name}: progress ({done:,} done)"], cwd=folder)
+            if rc == 0:
+                rc, out = git(["push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=folder, timeout=120)
+            if rc == 0:
+                return True
+            time.sleep(random.uniform(2, 6) + attempt)  # another machine saved just then: take theirs and go again
+    say(f"Couldn't save the shared progress ({out.strip()[:120]}); it goes up next time.")
+    return False
 
 
 def key_of(link):
@@ -420,6 +486,8 @@ def plan(quiet=False):
                 "There's no links CSV in the repo's top folder yet. Upload it there and a run starts by itself.")
         return [], [], {}
     status = load_status()
+    if SHARED_STATUS:  # what every machine has saved so far
+        merge_status(status, load_status(SHARED_STATUS))
     if RESTART_ON_CLEAR and status and list_restarted(links, status):
         start_over(status)
     if ADDRESS_REST_MINUTES > 0:  # tries used up by earlier cut-offs don't count any more
@@ -429,11 +497,13 @@ def plan(quiet=False):
     for row, link in links:  # keep row numbers current if rows moved
         if key_of(link) in status:
             status[key_of(link)]["row"] = row
-    todo = [(r, u) for r, u in links if not is_done(status.get(key_of(u)))]
+    mine = [(r, u) for r, u in links if in_my_part(u)]
+    todo = [(r, u) for r, u in mine if not is_done(status.get(key_of(u)))]
     if NEWEST_FIRST:
         todo.reverse()
     if not quiet:
-        say(f"{len(links):,} links: {len(links) - len(todo):,} done, {len(todo):,} to go"
+        share = f" (this machine's share: part {PART} of {PARTS}, {len(mine):,} links)" if PARTS > 1 else ""
+        say(f"{len(links):,} links{share}: {len(mine) - len(todo):,} done, {len(todo):,} to go"
             + (f". This run opens up to {min(LIMIT, len(todo)):,}." if LIMIT and todo else "."))
     return todo, links, status
 
@@ -549,7 +619,8 @@ INBOX_COPY = os.path.join(WORK, "inbox-copy")
 def push_reads_fast(files):
     """FAST_SAVE: saves the files through one copy of the inbox that stays open for the whole run. Only the repo's
     structure is downloaded, never the reads already in it; when someone else saved in between, the copy catches up
-    and the save goes again. Returns how many were saved (0 = use the usual way)."""
+    and the save goes again. Returns how many were saved: 0 = others kept saving in between (the reads wait for the
+    next save), None = this way doesn't work here (use the usual way)."""
     folder, names = INBOX_COPY, [f"{INBOX_FOLDER}/{n}" for n, _ in files]
     try:
         if not os.path.isdir(os.path.join(folder, ".git")):
@@ -558,7 +629,7 @@ def push_reads_fast(files):
             if rc != 0:
                 if any(w in out.lower() for w in AUTH_WORDS):
                     raise Stop(f"GitHub turned down {KEY_WHERE}: it's wrong, expired, or can't write to {INBOX_REPO}.")
-                return 0
+                return None
             git(["sparse-checkout", "set", "--no-cone", f"/{INBOX_FOLDER}/.link-opener"], cwd=folder)  # check out nothing
             git(["config", "user.name", "github-actions[bot]"], cwd=folder)
             git(["config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], cwd=folder)
@@ -566,13 +637,13 @@ def push_reads_fast(files):
         for name, data in files:
             with open(os.path.join(folder, INBOX_FOLDER, name), "wb") as f:
                 f.write(data)
-        for attempt in range(5):
+        for attempt in range(8):
             if git(["add", "--sparse", "--"] + names, cwd=folder)[0] != 0:
-                break
+                raise RuntimeError("couldn't add the reads")
             rc, out = git(["commit", "-q", "-m", f"{len(files)} read{'s' if len(files) != 1 else ''} from the link opener"],
                           cwd=folder)
             if rc != 0:
-                break
+                raise RuntimeError(out.strip()[:120] or "couldn't commit")
             rc, out = git(["push", "-q", "origin", "HEAD"], cwd=folder)
             if rc == 0:
                 return len(files)
@@ -581,14 +652,15 @@ def push_reads_fast(files):
             # someone else saved in between: take their latest, keep ours on top, and go again
             if git(["fetch", "-q", "--depth", "1", "origin", "HEAD"], cwd=folder)[0] != 0 or \
                     git(["reset", "-q", "FETCH_HEAD"], cwd=folder)[0] != 0:
-                break
-            time.sleep(min(20, 2 * (attempt + 1)))
+                raise RuntimeError("couldn't catch up with the others' saves")
+            time.sleep(random.uniform(1, 3) * (1 + attempt / 2))
+        return 0
     except Stop:
         raise
     except Exception as e:
         say(f"The quick save didn't work ({short(e)}); saving the usual way.")
     shutil.rmtree(folder, ignore_errors=True)  # start a fresh copy next time
-    return 0
+    return None
 
 
 # ---------- the copy to share (SHARE_REPO) ----------
@@ -682,7 +754,7 @@ def share_save(files):
         if rc != 0 or len(blobs) != len(files):
             raise RuntimeError(out.strip()[:150] or "couldn't store the files")
         entries = "".join(f"100644 {b}\t{SHARE_FOLDER}/{name}\n" for b, (name, _) in zip(blobs, files))
-        for attempt in range(5):
+        for attempt in range(8):
             base = share_open()
             new = share_entry(base, entries)
             if new is None:  # all there already
@@ -695,7 +767,7 @@ def share_save(files):
             rc2, out2 = share_git(["fetch", "-q", "--depth", "1", "origin", f"+{SHARE_REF}:{SHARE_TIP}"])
             if rc2 != 0 and "couldn't find remote ref" in out2.lower():
                 share_git(["update-ref", "-d", SHARE_TIP])  # emptied: start it again
-            time.sleep(1 + attempt)
+            time.sleep(random.uniform(0.5, 2) + attempt / 2)
         raise RuntimeError(out.strip()[:150] or "the save didn't go through")
 
 
@@ -793,6 +865,7 @@ class Saver:
         self.saves = 0
         self.lock = asyncio.Lock()
         self.task = None  # FAST_SAVE: the background save
+        self.last_save = 0.0
         self.share = Share()  # SHARE_REPO: the copy to share
 
     def add(self, reads, link):
@@ -811,8 +884,8 @@ class Saver:
             ms = int(time.time() * 1000)
             files = [f for i, rec in enumerate(batch.values()) if (f := file_for(rec, ms + i))]
             try:
-                n = await asyncio.to_thread(push_reads_fast, files) if FAST_SAVE and files else 0
-                if not n:
+                n = await asyncio.to_thread(push_reads_fast, files) if FAST_SAVE and files else None
+                if n is None:
                     n = await asyncio.to_thread(push_reads, files)
             except Stop:
                 raise
@@ -846,8 +919,14 @@ class Saver:
         fails = 0
         try:
             while self.pending and not job.stop and fails < 3:
+                wait = SAVE_EVERY_SECONDS - (time.time() - self.last_save)
+                if wait > 0:  # (reads that come in meanwhile go into this save)
+                    await asyncio.sleep(wait)
+                    if job.stop:
+                        break  # the last save at the end takes them
                 before = self.saved
                 await self.flush(force=True)
+                self.last_save = time.time()
                 if self.saved == before:  # didn't go through: try again a little later (the next read tries too)
                     fails += 1
                     await asyncio.sleep(15)
@@ -1530,7 +1609,8 @@ def report(job, final=False):
     pages = s["read"] + s["no read"] + s["not found"]
     data = (f" Proxy data: about {job.bytes / 1e6:.2f} MB"
             + (f", {job.bytes / 1e3 / pages:.0f} KB per page." if pages else ".")) if USE_PROXY else ""
-    line = (f"{'Done' if final else 'So far'}: {s['read']} read by the extension, {job.saver.saved} saved, "
+    part = f" (part {PART} of {PARTS})" if PARTS > 1 else ""
+    line = (f"{'Done' if final else 'So far'}{part}: {s['read']} read by the extension, {job.saver.saved} saved, "
             f"{s['no read']} no read, {s['blocked']} blocked, {s['error']} errors, {s['not found']} not found - "
             f"{mins:.0f} min.{data}")
     if s["limited"]:
@@ -1614,7 +1694,8 @@ async def watch_list(job):
             job.queued = {u for _, u in job.todo}
             for u in [u for u in job.second_looks if u not in current]:
                 del job.second_looks[u]
-        new = [(r, u) for r, u in links if u not in job.queued and not is_done(job.status.get(key_of(u)))]
+        new = [(r, u) for r, u in links
+               if u not in job.queued and in_my_part(u) and not is_done(job.status.get(key_of(u)))]
         if new:
             job.queued.update(u for _, u in new)
             if NEWEST_FIRST:
@@ -1624,6 +1705,13 @@ async def watch_list(job):
             job.last_busy = time.time()
             say(f"{len(new)} new link{'s' if len(new) != 1 else ''} in the list - opening "
                 f"{'them' if len(new) != 1 else 'it'} now.")
+
+
+async def keep_sharing_status(job):
+    """SHARED_STATUS: this machine's progress goes into the shared file now and then, not only at the end."""
+    while not job.stop:
+        await asyncio.sleep(SHARE_STATUS_MINUTES * 60)
+        await asyncio.to_thread(push_shared_status, {k: dict(r) for k, r in job.status.items()})
 
 
 DRIVERS = []  # the browser drivers' processes, so a second Ctrl+C can close the browsers at once
@@ -1696,6 +1784,7 @@ async def open_links():
     say(f"Starting {count} browser(s) with the extension" + (" through Decodo." if USE_PROXY else " without a proxy."))
     tasks = [asyncio.create_task(worker_loop(w, job)) for w in workers]
     watcher = asyncio.create_task(watch_list(job)) if WATCH_MINUTES > 0 else None
+    sharer = asyncio.create_task(keep_sharing_status(job)) if SHARED_STATUS else None
     if watcher:
         say(f"Links added to the list during this run are opened too; it stays open {WATCH_MINUTES:g} min after the "
             "last one.")
@@ -1740,12 +1829,16 @@ async def open_links():
                 pass
         if share.on and share.pending:
             say(f"{len(share.pending)} read(s) weren't copied to {share_name()} yet; the next run copies them.")
+        if sharer:
+            sharer.cancel()
         unsaved = 0
         for r in status.values():
             if r["status"] == "read":
                 r["status"] = "not saved"
                 unsaved += 1
         save_status(status)
+        if SHARED_STATUS:
+            await asyncio.to_thread(push_shared_status, {k: dict(r) for k, r in status.items()})
         line = report(job, final=True)
         if unsaved:
             say(f"{unsaved} read(s) couldn't be saved; those links get opened again next run.")
@@ -1756,7 +1849,7 @@ async def open_links():
             links = (read_links() or links) if WATCH_MINUTES > 0 else links  # (new links may have come in)
         except Exception:
             pass
-        left = sum(1 for _, u in links if not is_done(status.get(key_of(u))))
+        left = sum(1 for _, u in links if in_my_part(u) and not is_done(status.get(key_of(u))))
         output(more=str(bool(left) and job.saver.saved > 0 and not job.problem).lower(),
                message=f"Opened links: {job.saver.saved} saved, {left} to go")
     if job.problem:
@@ -1777,7 +1870,7 @@ def refresh_progress():
     """On GitHub, a run that waited in line is handed this repo as it was when it was queued, so it would miss the
     progress the run before it saved - it would read those links again, and then fail to save its own progress. So
     the progress file's repo is brought up to date first."""
-    folder = os.path.dirname(STATUS_FILE)
+    folder = os.path.dirname(os.path.abspath(SHARED_STATUS or STATUS_FILE))
     if not os.environ.get("GITHUB_ACTIONS") or not os.path.isdir(os.path.join(folder, ".git")):
         return
     branch = os.environ.get("GITHUB_REF_NAME") or "main"
@@ -1790,13 +1883,18 @@ def refresh_progress():
 
 def main():
     what = sys.argv[1] if len(sys.argv) > 1 else ""
-    if what not in ("plan", "open"):
-        sys.exit("Use: python 11.py plan | open")
+    if what not in ("plan", "open", "save"):
+        sys.exit("Use: python 11.py plan | open | save")
     if not os.path.isdir(REPO):
         sys.exit(f"Can't find the results repo folder ({REPO}).")
     refresh_progress()
     try:
-        if what == "plan":
+        if what == "save":  # SHARED_STATUS: this machine's progress into the shared file (after the run, to be sure)
+            if push_shared_status(load_status()):
+                say("Progress saved.")
+            else:
+                sys.exit(1)
+        elif what == "plan":
             todo, _, _ = plan()
             output(work=str(bool(todo)).lower())
         else:
