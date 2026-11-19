@@ -8,7 +8,7 @@ Each time you press Run (the triangle in VS Code), it:
   - gets only the list file from card-data, and only your extension's folder from results-links, using this
     Mac's own GitHub login;
   - picks up the progress the GitHub run saved (18.csv in scrap), so nothing it read is opened again;
-  - opens the links still to go through Decodo's ISP plan, on the list's own addresses (ports 10006-10010, so your
+  - opens the links still to go through Decodo's ISP plan, on the list's own addresses (ports 10006-10050, so your
     scans keep theirs), with your extension loaded, 3-8 seconds between pages;
   - saves each read to cardladder/ in your inbox repo as soon as it's read, and copies it to cardladder/ in
     scan-results (one history entry, no message), exactly like the GitHub run.
@@ -40,7 +40,7 @@ REST_MINUTES = 30  # an address the site turns away rests this long (twice as lo
 
 PASSWORD_FILE = "~/decodo-isp-password.txt"  # the ISP plan's proxy password, only on this Mac
 PROXY_HOST = "isp.decodo.com"
-PROXY_PORTS = "10006-10010"  # the list's addresses (the scan run keeps 10001-10005). Add new ports here if you buy more.
+PROXY_PORTS = "10006-10050"  # the list's addresses (the scan run keeps 10001-10005). Add new ports here if you buy more.
 PROXY_USER = "spdtx2m9da"
 
 LIST_REPO = "BrettS600/card-data"
