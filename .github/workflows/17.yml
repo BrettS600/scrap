@@ -6,17 +6,21 @@
 # cardladder/ in scan-results, whose history is kept at one entry with no message, so that repo shows the reads and
 # nothing else. The list is worked through from the top; links you add to it later are opened too.
 #
+# Four of GitHub's machines work on the list side by side, each with 4 browsers, its own share of the links and its own
+# group of addresses (ports 10006-10050 of the ISP plan, about 11 each). Every link is in exactly one share, so nothing
+# is opened twice. When the site turns an address away, that address rests and another of the machine's takes over.
+#
 # Adding links is what starts it: while a run is open it checks the list every 30 seconds, and every 5 minutes a check
 # starts a run if new links have come in. A run stops after 5 hours and starts the next one itself while links are
 # left; once the list is done, it stays open 2 hours for more. (While a run is open, the 5-minute checks wait behind it
 # and show as "cancelled" on the Actions tab: that's normal.)
 #
-# Your scans come first: this run uses ports 10006-10010 of the ISP plan and the scan run (15.yml) 10001-10005, so
-# this list never slows a scan down.
+# Your scans come first: the scan run (15.yml) keeps ports 10001-10005 to itself, so this list never slows a scan down.
 #
 # A link is opened once, ever (clearing the list doesn't start it over). Progress is kept in this repo as 18.csv,
-# scrambled - each link is a code that can't be turned back into the link without SCAN_SCRAMBLE_KEY. The logs (and the
-# reports on the "List opener reports" issue) only show row numbers and counts.
+# scrambled - each link is a code that can't be turned back into the link without SCAN_SCRAMBLE_KEY. Each machine merges
+# its progress into it every 10 minutes and at the end, so they never overwrite each other. The logs (and the reports on
+# the "List opener reports" issue, one per machine) only show row numbers and counts.
 #
 # Secrets: the same ones as 15.yml, nothing new (CARD_READ_KEY, CARD_INBOX_KEY, SCAN_RESULTS_KEY, DECODO_PASSWORD,
 # SCAN_SCRAMBLE_KEY).
@@ -47,15 +51,15 @@ env:
   RESTART_ON_CLEAR: "false" # each link is opened once, ever
   NEWEST_FIRST: "false" # from the top of the list down; links added later go after the rest
   SITE_GAPS: "5:180,3:60,2:20" # if pages come back empty, slow down on that site (as for links.csv)
-  FAST_SAVE: "true" # save each read as soon as it's read
+  FAST_SAVE: "true" # save the reads as they come in...
   BATCH: "1"
-  PAUSE_SECONDS: "1-3" # wait between pages, in seconds
+  SAVE_EVERY_SECONDS: "30" # ...at most every 30 seconds per machine, so the four don't keep saving over each other
+  PAUSE_SECONDS: "3-8" # wait between pages, in seconds
   READ_WAIT_SECONDS: "25"
   SETTLE_SECONDS: "5"
   LIGHT: "true" # skip pictures, fonts, video and trackers
   USE_PROXY: "true"
-  PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 10 fixed addresses, one per port
-  PROXY_PORTS: "10006-10010" # this list's 5; the scan run has 10001-10005
+  PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 50 fixed addresses, one per port (the ports are set per machine below)
   PROXY_USER: "spdtx2m9da"
   SCANS_REPO: "BrettS600/card-data"
   SCANS_FILE: "data/cardladder/pic_certs/card_ladder_cert.csv" # the only file taken from card-data
@@ -68,13 +72,30 @@ env:
   LINKS_FILE: "list.csv"
   LINK_COLUMN: "0"
   REPO_DIR: work
-  STATUS_FILE: ${{ github.workspace }}/code/18.csv
+  STATUS_FILE: ${{ github.workspace }}/progress.csv # this machine's progress
+  SHARED_STATUS: ${{ github.workspace }}/code/18.csv # everyone's, merged
+  PARTS: "4"
 
 jobs:
   open:
-    name: "Open the list"
+    name: "Open the list (part ${{ matrix.part }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 340
+    strategy:
+      fail-fast: false # one machine having a problem doesn't stop the others
+      matrix:
+        include: # each machine's share of the list and its own addresses (the scan run keeps 10001-10005)
+          - part: 1
+            ports: "10006-10016"
+          - part: 2
+            ports: "10017-10027"
+          - part: 3
+            ports: "10028-10038"
+          - part: 4
+            ports: "10039-10050"
+    env:
+      PART: ${{ matrix.part }}
+      PROXY_PORTS: ${{ matrix.ports }}
     steps:
       - name: Get the code and the progress
         uses: actions/checkout@v4
@@ -157,27 +178,9 @@ jobs:
       - name: Save progress (scrambled)
         id: save
         if: always() && steps.plan.outputs.work == 'true'
-        working-directory: code
         env:
-          MESSAGE: ${{ steps.open.outputs.message }}
-        run: |
-          if [ ! -f 18.csv ]; then echo "Nothing to save."; exit 0; fi
-          if grep -qiE "https?://|www\." 18.csv; then
-            echo "18.csv has links in it, so it isn't saved (SCAN_SCRAMBLE_KEY must be set)."
-            exit 1
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add 18.csv
-          if git diff --cached --quiet; then echo "Nothing new to save."; exit 0; fi
-          git commit -q -m "18.csv: ${MESSAGE:-list progress}"
-          for i in 1 2 3 4 5; do
-            if git pull -q --rebase && git push -q; then echo "Progress saved."; exit 0; fi
-            git rebase --abort 2> /dev/null || true
-            sleep $((i * 10))
-          done
-          echo "Couldn't save 18.csv."
-          exit 1
+          LINK_KEY: ${{ secrets.SCAN_SCRAMBLE_KEY }}
+        run: python code/11.py save # merges this machine's progress into 18.csv (it saves as it goes, too)
       - name: Start the next run
         if: steps.open.outputs.more == 'true' && env.KEEP_GOING == 'true'
         env:
@@ -195,7 +198,7 @@ jobs:
         run: |
           report="$RUNNER_TEMP/report.md"
           {
-            echo "### List run $GITHUB_RUN_NUMBER: $RESULT ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            echo "### List run $GITHUB_RUN_NUMBER, part $PART: $RESULT ($(date -u '+%Y-%m-%d %H:%M UTC'))"
             echo "Steps - $STEPS"
             if [ -s "$RUNNER_TEMP/opener.log" ]; then
               echo; echo "Log (last 40 lines; row numbers and counts only):"; echo '```'
