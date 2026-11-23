@@ -206,8 +206,10 @@ jobs:
             fi
           } > "$report"
           title="Link opener reports"
-          issue=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number,title \
-            --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+          # (by listing the open issues, not GitHub's search, which can lag behind - after the account rename it
+          # found nothing and each report opened a new issue; the oldest one with this title is used)
+          issue=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 200 --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | sort -n | head -n 1)
           if [ -z "$issue" ]; then
             issue=$(gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
               --body "Each run adds a comment here: counts, step results and stop reasons only." | grep -o '[0-9]*$')
