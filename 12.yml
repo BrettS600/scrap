@@ -12,8 +12,8 @@
 # left over, or when you press "Run workflow" on the Actions tab. Progress is kept in opened.csv.
 #
 # Needs the repo secret CARD_INBOX_KEY (a GitHub key that can write to the inbox repo), and
-# DECODO_PASSWORD (the proxy password) when USE_PROXY is "true". The code is 11.py in BrettS600/scrap.
-# Optional third secret, SCRAP_REPORT_KEY (a GitHub key for BrettS600/scrap only, Issues: Read and
+# DECODO_PASSWORD (the proxy password) when USE_PROXY is "true". The code is 11.py in driftcodedev/scrap.
+# Optional third secret, SCRAP_REPORT_KEY (a GitHub key for driftcodedev/scrap only, Issues: Read and
 # write): with it, every run posts a short report (counts, step results, stop reasons - no links)
 # as a comment on the "Link opener reports" issue in scrap, so the chat that built this can read it.
 
@@ -48,7 +48,7 @@ env:
   LINKS_FILE: "scans.csv" # the barcode-scan list. (The big list, links.csv, is done on your Mac by 13.py.)
   LINK_COLUMN: "0" # 0 = the first web address in each row; or a column number or heading
   EXTENSION_FOLDER: "cert-reader" # the extension's folder in this repo
-  INBOX_REPO: "BrettS600/card-inbox" # where the reads are saved
+  INBOX_REPO: "driftcodedev/card-inbox" # where the reads are saved
   INBOX_FOLDER: "certs"
   BATCH: "100" # reads per save
   READ_WAIT_SECONDS: "25" # longest wait for the extension's first read of a page
@@ -57,7 +57,7 @@ env:
   PROXY_HOST: "us.decodo.com"
   PROXY_PORTS: "10001-10010"
   PROXY_USER: "user-sp2e2o4qkx-sessionduration-30"
-  CODE_REPO: "BrettS600/scrap"
+  CODE_REPO: "driftcodedev/scrap"
   REPO_DIR: repo
 
 jobs:

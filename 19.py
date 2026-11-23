@@ -43,18 +43,18 @@ PROXY_HOST = "isp.decodo.com"
 PROXY_PORTS = "10006-10050"  # the list's addresses (the scan run keeps 10001-10005). Add new ports here if you buy more.
 PROXY_USER = "spdtx2m9da"
 
-LIST_REPO = "BrettS600/card-data"
+LIST_REPO = "driftcodedev/card-data"
 LIST_FILE = "data/cardladder/pic_certs/card_ladder_cert.csv"  # the only file taken from card-data
-EXTENSION_REPO = "BrettS600/results-links"
+EXTENSION_REPO = "driftcodedev/results-links"
 EXTENSION_FOLDER = "cert-reader"  # the only folder taken from results-links
-INBOX_REPO = "BrettS600/card-inbox"
+INBOX_REPO = "driftcodedev/card-inbox"
 INBOX_FOLDER = "cardladder"  # the reads go here
 KEY_FILE = "~/card-inbox-key.txt"  # a GitHub key that can write to the inbox repo
-SHARE_REPO = "BrettS600/scan-results"
+SHARE_REPO = "driftcodedev/scan-results"
 SHARE_FOLDER = "cardladder"  # and a copy of each read here
 SHARE_KEY_FILE = "~/scan-results-key.txt"  # a GitHub key that can write to scan-results
 SCRAMBLE_FILE = "~/scan-scramble-key.txt"  # the same text as the SCAN_SCRAMBLE_KEY secret in scrap
-PROGRESS_REPO = "BrettS600/scrap"
+PROGRESS_REPO = "driftcodedev/scrap"
 PROGRESS_FILE = "18.csv"  # the progress the GitHub list run keeps, shared with this Mac
 FOLDER = "~/scrap-private"  # this Mac's copies, progress file and log
 
@@ -97,7 +97,7 @@ STATUS_COLS = ["row", "link", "status", "tries", "time", "run"]
 DONE = ("saved", "not found")
 AUTH_WORDS = ("403", "401", "authentication failed", "could not read username", "permission to",
               "invalid username or password", "repository not found", "access denied", "write access")
-WHO = ["-c", "user.name=BrettS600", "-c", "user.email=328803362+BrettS600@users.noreply.github.com",
+WHO = ["-c", "user.name=driftcodedev", "-c", "user.email=328803362+driftcodedev@users.noreply.github.com",
        "-c", "commit.gpgsign=false"]
 
 opener = None  # 11.py, once loaded

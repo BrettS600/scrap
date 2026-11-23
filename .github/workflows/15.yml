@@ -7,7 +7,7 @@
 # message, so that repo shows the reads and nothing else. Once the list is done, the run stays open 2 hours and checks
 # for new scans every 5 seconds. It also checks every 3 hours, in case a start signal was missed.
 #
-# It has ports 10001-10005 of the ISP plan to itself; the list run (17.yml) uses 10006-10010, so it never slows a scan.
+# It has ports 10001-10005 of the ISP plan to itself; the list run (17.yml) uses 10006-10050, so it never slows a scan.
 #
 # A link is opened once per show: progress is kept in this repo as 16.csv, scrambled - each link is a code that can't
 # be turned back into the link without SCAN_SCRAMBLE_KEY. When you clear scans.csv for a new show, the run sees the
@@ -54,16 +54,16 @@ env:
   SETTLE_SECONDS: "5"
   LIGHT: "true" # skip pictures, fonts, video and trackers
   USE_PROXY: "true"
-  PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 10 fixed addresses, one per port
-  PROXY_PORTS: "10001-10005" # the scan run's 5; the list run (17.yml) has 10006-10010
+  PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 50 fixed addresses, one per port
+  PROXY_PORTS: "10001-10005" # the scan run's 5; the list run (17.yml) has 10006-10050
   PROXY_USER: "spdtx2m9da"
-  SCANS_REPO: "BrettS600/card-data"
+  SCANS_REPO: "driftcodedev/card-data"
   SCANS_FILE: "data/scans/scans.csv" # the only file taken from card-data
-  EXTENSION_REPO: "BrettS600/results-links"
+  EXTENSION_REPO: "driftcodedev/results-links"
   EXTENSION_FOLDER: "cert-reader" # the only folder taken from results-links
-  INBOX_REPO: "BrettS600/card-inbox"
+  INBOX_REPO: "driftcodedev/card-inbox"
   INBOX_FOLDER: "scans" # scan reads go here
-  SHARE_REPO: "BrettS600/scan-results" # and a copy of each one here, history kept at one entry
+  SHARE_REPO: "driftcodedev/scan-results" # and a copy of each one here, history kept at one entry
   SHARE_FOLDER: "scans"
   LINKS_FILE: "scans.csv"
   LINK_COLUMN: "0"

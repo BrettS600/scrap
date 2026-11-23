@@ -9,7 +9,7 @@
 # A run starts by itself when the links file, fields.json or this file changes, every 6 hours to pick
 # up anything left over, or when you press "Run workflow" on the Actions tab.
 #
-# The code is 9.py in BrettS600/scrap. The proxy password comes from the repo secret DECODO_PASSWORD.
+# The code is 9.py in driftcodedev/scrap. The proxy password comes from the repo secret DECODO_PASSWORD.
 # Settings are in env: below.
 
 name: Link queue
@@ -54,7 +54,7 @@ env:
   PROXY_HOST: "us.decodo.com"
   PROXY_PORTS: "10001-10010"
   PROXY_USER: "user-sp2e2o4qkx-sessionduration-30"
-  CODE_REPO: "BrettS600/scrap"
+  CODE_REPO: "driftcodedev/scrap"
   REPO_DIR: repo
   PAGES_DIR: pages
   INBOX_DIR: inbox

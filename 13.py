@@ -39,10 +39,10 @@ PROXY_HOST = "us.decodo.com"
 PROXY_PORTS = "10001-10010"  # each port is its own address, kept for 30 minutes
 PROXY_USER = "user-sp2e2o4qkx-sessionduration-30"
 
-RESULTS_REPO = "BrettS600/results-links"  # holds links.csv and your extension (cert-reader/)
+RESULTS_REPO = "driftcodedev/results-links"  # holds links.csv and your extension (cert-reader/)
 LINKS_FILE = "links.csv"
 EXTENSION_FOLDER = "cert-reader"
-INBOX_REPO = "BrettS600/card-inbox"  # where the reads are saved (in its certs folder)
+INBOX_REPO = "driftcodedev/card-inbox"  # where the reads are saved (in its certs folder)
 KEY_FILE = "~/card-inbox-key.txt"  # a GitHub key that can write to the inbox repo
 FOLDER = "~/scrap-private"  # this Mac's copy of the repo, the progress file and the log
 
@@ -70,7 +70,7 @@ PROGRESS = os.path.join(HOME_FOLDER, "mac-progress.csv")
 LOG = os.path.join(HOME_FOLDER, "mac-log.txt")
 WORK = os.path.join(HOME_FOLDER, "mac-work")
 CODE_COPY = os.path.join(WORK, "scrap")
-CODE_URL = os.environ.get("CODE_URL") or "https://github.com/BrettS600/scrap.git"
+CODE_URL = os.environ.get("CODE_URL") or "https://github.com/driftcodedev/scrap.git"
 RESULTS_URL = os.environ.get("RESULTS_URL") or f"https://github.com/{RESULTS_REPO}.git"
 STATUS_COLS = ["row", "link", "status", "tries", "time", "run"]
 AUTH_WORDS = ("403", "401", "authentication failed", "could not read username", "permission to",

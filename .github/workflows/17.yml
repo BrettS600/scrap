@@ -61,13 +61,13 @@ env:
   USE_PROXY: "true"
   PROXY_HOST: "isp.decodo.com" # Decodo's ISP plan: 50 fixed addresses, one per port (the ports are set per machine below)
   PROXY_USER: "spdtx2m9da"
-  SCANS_REPO: "BrettS600/card-data"
+  SCANS_REPO: "driftcodedev/card-data"
   SCANS_FILE: "data/cardladder/pic_certs/card_ladder_cert.csv" # the only file taken from card-data
-  EXTENSION_REPO: "BrettS600/results-links"
+  EXTENSION_REPO: "driftcodedev/results-links"
   EXTENSION_FOLDER: "cert-reader" # the only folder taken from results-links
-  INBOX_REPO: "BrettS600/card-inbox"
+  INBOX_REPO: "driftcodedev/card-inbox"
   INBOX_FOLDER: "cardladder" # these reads go here
-  SHARE_REPO: "BrettS600/scan-results" # and a copy of each one here, history kept at one entry
+  SHARE_REPO: "driftcodedev/scan-results" # and a copy of each one here, history kept at one entry
   SHARE_FOLDER: "cardladder"
   LINKS_FILE: "list.csv"
   LINK_COLUMN: "0"

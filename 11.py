@@ -79,7 +79,7 @@ PROXY_USER = env("PROXY_USER", "user-sp2e2o4qkx-sessionduration-30")
 PASSWORD = os.environ.get("DECODO_PASSWORD", "").strip()  # GitHub secret; never printed
 
 EXTENSION_FOLDER = env("EXTENSION_FOLDER", "cert-reader")  # the extension's folder in the results repo
-INBOX_REPO = env("INBOX_REPO", "BrettS600/card-inbox")  # where reads are saved
+INBOX_REPO = env("INBOX_REPO", "driftcodedev/card-inbox")  # where reads are saved
 INBOX_FOLDER = env("INBOX_FOLDER", "certs")  # folder in that repo
 KEY = os.environ.get("CARD_INBOX_KEY", "").strip()  # GitHub key that can write to INBOX_REPO; never printed
 KEY_WHERE = env("KEY_WHERE", "the CARD_INBOX_KEY secret")  # where that key is kept, for messages
